@@ -1,0 +1,45 @@
+# ===================== Python 通用 =====================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ===================== akshare下载缓存 / 临时文件 =====================
+*.tmp
+*.temp
+*.log
+logs/
+cache/
+
+# ===================== VS Code / IDE =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# ===================== 系统文件 =====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+
