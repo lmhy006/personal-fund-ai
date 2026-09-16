@@ -16,7 +16,7 @@ BENCH_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "benchmark_hs300.csv")
 # 面板口径常量
 FEATURE_LOOKBACK = 252      # 特征回看窗口：12个月交易日
 LABEL_HORIZON = 126         # 标签前瞻窗口：6个月交易日
-MIN_AGE_DAYS = 252          # 截面时点要求成立≥12个月（age(t)≥1年）
+MIN_AGE_NATURAL_DAYS = 365  # 截面时点要求成立≥12个自然月（365天，此前误用252自然日≈8.3个月）
 MIN_COVERAGE = 0.95         # 时变eligibility：窗口内观测数/基准交易日数
 MAX_GAP_DAYS = 15           # 截面/标签端点附近允许的最大披露缺口（自然日）
 RET_BENCH_RATE = 0.02 / 252  # 日频无风险利率（夏普/alpha用）
@@ -24,6 +24,15 @@ RET_BENCH_RATE = 0.02 / 252  # 日频无风险利率（夏普/alpha用）
 # 短周期特征窗口（交易日）
 SHORT_WINDOWS = {"ret_1m": 21, "ret_3m": 63, "ret_6m": 126, "ret_12m": 252}
 DAY_NS = 86400 * 10**9  # 1天对应的int64纳秒
+MONTH_NS = 30.4375 * DAY_NS  # 平均月长（用于age计算）
+# 基金年龄分层（分层模型依据）：age_months 12~36 = 短历史段；≥36 = 长历史段
+SHORT_HISTORY_AGE = (12, 36)
+FULL_HISTORY_AGE = 36
+
+
+def age_days_to_months(age_days_ns: int) -> float:
+    """基金年龄（自然日纳秒数）→ 月数"""
+    return age_days_ns / MONTH_NS
 
 
 def load_fund_series(bench_dates: np.ndarray):
@@ -105,7 +114,7 @@ def build_panel():
         for code, s in series.items():
             dates = s["dates"]
             # 时变eligibility 1：成立满12个月（基金首日 ≤ 截面 - 1年）
-            if dates[0] > t_ns - MIN_AGE_DAYS * DAY_NS:
+            if dates[0] > t_ns - MIN_AGE_NATURAL_DAYS * DAY_NS:
                 continue
             # 截面当期有披露（t附近15天内有净值日）
             j_t = int(np.searchsorted(dates, t_ns, side="right")) - 1
@@ -123,8 +132,10 @@ def build_panel():
             if cov < MIN_COVERAGE:
                 continue
             rv = rw[~np.isnan(rw)]
+            age_days = t_ns - dates[0]  # 基金在该截面时的年龄（自然日）
             row = {"fund_code": code, "t_date": pd.Timestamp(t_ns, unit="ns"),
                    "fund_name": name_map.get(code, ""),
+                   "age_months": round(age_days_to_months(age_days), 1),
                    "coverage": round(cov, 4)}
             # 复利区间收益：W(t)/W(t-k)-1
             for name, k in SHORT_WINDOWS.items():
@@ -139,6 +150,8 @@ def build_panel():
             row["alpha_12m"] = alpha
             # 标签：未来6个月复利收益 W(t+h)/W(t)-1（对齐数组的财富在未披露日自然保持前值）
             row["future_ret_6m"] = float(s["wealth_al"][i_end] / s["wealth_al"][i_t] - 1.0)
+            # 标签结束日：验证器据此判定"训练行的标签是否已到期能用于本次训练"
+            row["label_end_date"] = pd.Timestamp(label_end_ns, unit="ns")
             rows.append(row)
         n_months += 1
 
