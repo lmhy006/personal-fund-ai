@@ -1,18 +1,27 @@
 import os
+import re
+import shutil
 import pandas as pd
 import numpy as np
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 
-RAW_FUND_NAV_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "fund_nav")
+RAW_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
+RAW_FUND_NAV_DIR = os.path.join(RAW_DATA_DIR, "fund_nav")
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed")
+TMP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_tmp")
 CLEAN_REPORT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "clean_report.csv")
+POOL_PATH = os.path.join(RAW_DATA_DIR, "phase0_fund_pool.csv")
 
-# 时间跨度门槛：自然日，低于该值整个基金直接剔除
-MIN_DATE_SPAN_DAYS = 730
+# 统一分析窗口：近 WINDOW_YEARS 年，锚点=全部基金最新净值日期（全局统一，避免各取"自己最后三年"造成窗口错位）
+WINDOW_YEARS = 3
+# 窗口边缘容差：起点后/终点前容差天数，覆盖净值披露日不同步的情况
+EDGE_TOLERANCE_DAYS = 30
 # 可疑跳变阈值：单日涨跌幅绝对值
 JUMP_THRESHOLD = 0.20
+# 份额后缀正则：基金简称尾部单个份额字母（A/C/D/E/H/I/M），用于同基金不同份额聚类
+SHARE_SUFFIX_RE = re.compile(r"[ACDEHIM]$")
 
 # 创建输出目录
 os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -70,27 +79,95 @@ def clean_fund(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return df, stat
 
 
+def calc_window_anchor(file_list: list) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    扫描全部raw文件的最新净值日期，确定全局统一窗口 [window_start, window_end]
+    锚点必须全局统一，各基金不能各自取"自己的最后N年"，否则窗口错位失去可比性
+    """
+    window_end = None
+    for fname in file_list:
+        df = pd.read_csv(os.path.join(RAW_FUND_NAV_DIR, fname), usecols=["date"], parse_dates=["date"])
+        dmax = df["date"].max()
+        if window_end is None or dmax > window_end:
+            window_end = dmax
+    window_start = window_end - pd.DateOffset(years=WINDOW_YEARS)
+    return window_start, window_end
+
+
+def share_cluster_key(name: str) -> str:
+    """基金简称去掉尾部份额字母，得到同基金不同份额的聚类key"""
+    return SHARE_SUFFIX_RE.sub("", str(name).strip())
+
+
+def dedup_shares(passed: list, report_list: list) -> list:
+    """
+    份额去重（批量层）：同一基金不同份额只保留一个代表份额
+    代表规则：簇内保留窗口内跨度最长者，并列时优先A类（简称尾部A），再按代码升序
+    必须在行级清洗和窗口校验之后执行：先各自过质量关，再选代表，避免误杀整簇
+    :param passed: [(fund_code, df_win, stat, span), ...] 已通过校验的基金
+    :param report_list: 清洗报告列表，非代表份额在此追加 reject_duplicate_share 记录
+    :return: 代表份额列表 [(fund_code, df_win, stat, span), ...]
+    """
+    # 名称来自基金池文件；缺失名称的基金各自独立成簇（code本身做key，不会误合并）
+    name_map = {}
+    if os.path.exists(POOL_PATH):
+        pool_df = pd.read_csv(POOL_PATH, dtype={"基金代码": str})
+        name_map = dict(zip(pool_df["基金代码"], pool_df["基金简称"].astype(str)))
+
+    clusters = {}
+    for fund_code, df_win, stat, span in passed:
+        name = name_map.get(fund_code, "")
+        key = share_cluster_key(name) if name else f"__code_{fund_code}"
+        clusters.setdefault(key, []).append((fund_code, df_win, stat, span, name))
+
+    kept = []
+    for members in clusters.values():
+        members_sorted = sorted(
+            members,
+            key=lambda m: (-m[3], 0 if m[4].endswith("A") else 1, m[0])
+        )
+        keep = members_sorted[0]
+        kept.append(keep[:4])
+        for fund_code, df_win, stat, span, name in members_sorted[1:]:
+            report_list.append({
+                "fund_code": fund_code,
+                "status": "reject_duplicate_share",
+                "reason": f"与代表份额{keep[0]}({keep[4]})为同一基金",
+                **stat,
+                "clean_date_span_days": span
+            })
+            print(f"[{fund_code}] 与 {keep[0]}({keep[4]}) 同基金不同份额，保留代表份额")
+    return kept
+
+
 def clean_all():
     """
     批量清洗全部基金
     1. 【幂等】先清除processed目录下旧 fund_*.csv
     2. 读取raw/fund_nav下面所有fund_*.csv
     3. 调用clean_fund做行层面清洗，捕获清洗阶段异常
-    4. 【批量层】判断时间跨度，不足MIN_DATE_SPAN_DAYS直接整只剔除
-    5. 通过的基金写入 data/processed/fund_xxxxxx.csv
-    6. 输出clean_report.csv，记录全部基金状态
+    4. 【批量层】统一窗口校验：窗口起点覆盖不足 / 窗口尾部缺数据 的基金整只剔除
+    5. 截断到统一窗口（近WINDOW_YEARS年），保证跨基金可比
+    6. 【批量层】份额去重：同基金不同份额只保留代表份额（历史最长，并列优先A类）
+    7. 通过的基金写入临时目录，全部完成后整目录原子替换正式目录
+       （避免"先删旧再逐个写"中途失败留下半新半旧混批；最坏情况旧批次完整保留，tmp残留待下轮清理）
+    8. 输出clean_report.csv，记录全部基金状态（swap成功后才写，报告永远与processed配套）
     """
-    # 幂等：删除上一轮残留的基金csv，保留报告文件
-    print(f"开始清理 {PROCESSED_DIR} 下旧的 fund_*.csv 文件……")
-    for fname in os.listdir(PROCESSED_DIR):
-        file_path = os.path.join(PROCESSED_DIR, fname)
-        if os.path.isfile(file_path) and fname.startswith("fund_") and fname.endswith(".csv"):
-            os.remove(file_path)
-    print("旧基金csv清理完毕，开始本轮清洗\n")
+    # 幂等：清理上轮swap失败可能残留的临时目录，本轮先写tmp
+    if os.path.exists(TMP_DIR):
+        shutil.rmtree(TMP_DIR)
+    os.makedirs(TMP_DIR, exist_ok=True)
+    print(f"临时目录就绪：{TMP_DIR}\n")
 
     report_list = []
     file_list = [f for f in os.listdir(RAW_FUND_NAV_DIR) if f.startswith("fund_") and f.endswith(".csv")]
-    print(f"待清洗基金总数：{len(file_list)}，最小时间门槛 {MIN_DATE_SPAN_DAYS} 自然日")
+    print(f"待清洗基金总数：{len(file_list)}")
+
+    # 统一分析窗口锚点（全局一致，保证跨基金可比）
+    window_start, window_end = calc_window_anchor(file_list)
+    print(f"统一分析窗口：{window_start.date()} ~ {window_end.date()}（近{WINDOW_YEARS}年，边缘容差{EDGE_TOLERANCE_DAYS}天）\n")
+
+    passed = []  # 暂存通过校验的基金，去重后统一写盘
 
     for fname in file_list:
         fund_code = fname.replace("fund_", "").replace(".csv", "")
@@ -143,27 +220,44 @@ def clean_all():
             print(f"[{fund_code}] ⚠️ 清洗后为空，整只剔除")
             continue
 
-        # 批量层：计算清洗后的时间跨度，判断是否达标
-        date_start = df_clean["date"].min()
-        date_end = df_clean["date"].max()
-        clean_span = (date_end - date_start).days
-
-        if clean_span < MIN_DATE_SPAN_DAYS:
+        # 批量层校验1：窗口覆盖起点——窗口起点容差之外才开始披露净值的基金，无法覆盖全窗口
+        first_date = df_clean["date"].min()
+        if first_date > window_start + pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
             report_list.append({
                 "fund_code": fund_code,
                 "status": "reject_short_history",
-                "reason": f"历史过短:{clean_span}天 < {MIN_DATE_SPAN_DAYS}",
+                "reason": f"窗口覆盖不足：首个净值日{first_date.date()} 晚于窗口起点{window_start.date()}+{EDGE_TOLERANCE_DAYS}天",
                 **stat,
-                "clean_date_span_days": clean_span
+                "clean_date_span_days": 0
             })
-            print(f"[{fund_code}] 历史过短 {clean_span}天，整只剔除")
+            print(f"[{fund_code}] ⚠️ 覆盖不足{WINDOW_YEARS}年窗口（首日{first_date.date()}），整只剔除")
             continue
 
-        # 全部校验通过，写入processed
-        out_file = f"fund_{fund_code}.csv"
-        out_path = os.path.join(PROCESSED_DIR, out_file)
-        df_clean.to_csv(out_path, index=False, encoding="utf-8-sig")
+        # 批量层校验2：数据新鲜度——窗口尾部缺数据的基金（可能清盘/停披露），统一时点比较无意义
+        last_date = df_clean["date"].max()
+        if last_date < window_end - pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
+            report_list.append({
+                "fund_code": fund_code,
+                "status": "reject_stale_data",
+                "reason": f"窗口尾部缺数据：最后净值日{last_date.date()} 早于窗口终点{window_end.date()}-{EDGE_TOLERANCE_DAYS}天",
+                **stat,
+                "clean_date_span_days": 0
+            })
+            print(f"[{fund_code}] ⚠️ 窗口尾部缺数据（最后{last_date.date()}），整只剔除")
+            continue
 
+        # 截断到统一窗口后暂存
+        df_win = df_clean[(df_clean["date"] >= window_start) & (df_clean["date"] <= window_end)].reset_index(drop=True)
+        clean_span = (df_win["date"].max() - df_win["date"].min()).days
+        passed.append((fund_code, df_win, stat, clean_span))
+
+    # 份额去重：同基金不同份额只保留代表份额
+    kept = dedup_shares(passed, report_list)
+
+    # 写入临时目录 + ok记录
+    for fund_code, df_win, stat, clean_span in kept:
+        out_path = os.path.join(TMP_DIR, f"fund_{fund_code}.csv")
+        df_win.to_csv(out_path, index=False, encoding="utf-8-sig")
         report_list.append({
             "fund_code": fund_code,
             "status": "ok",
@@ -171,9 +265,15 @@ def clean_all():
             **stat,
             "clean_date_span_days": clean_span
         })
-        print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
+        print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 窗口内跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
 
-    # 输出清洗报告（覆盖旧报告）
+    # 原子替换：全部基金写盘成功后才用tmp整目录替换正式目录
+    # 同盘rename接近原子；若被占用失败则正式目录仍是完整旧批次，tmp残留待下轮清理
+    shutil.rmtree(PROCESSED_DIR)
+    os.rename(TMP_DIR, PROCESSED_DIR)
+    print(f"\nprocessed目录已原子替换：{PROCESSED_DIR}（{len(kept)} 只）")
+
+    # 输出清洗报告（覆盖旧报告；swap成功后才写，保证报告与processed配套）
     df_report = pd.DataFrame(report_list)
     df_report.to_csv(CLEAN_REPORT_PATH, index=False, encoding="utf-8-sig")
 
@@ -182,11 +282,15 @@ def clean_all():
     cnt_err_clean = (df_report["status"] == "error_clean").sum()
     cnt_reject_empty = (df_report["status"] == "reject_empty").sum()
     cnt_reject_short = (df_report["status"] == "reject_short_history").sum()
+    cnt_reject_stale = (df_report["status"] == "reject_stale_data").sum()
+    cnt_reject_dup = (df_report["status"] == "reject_duplicate_share").sum()
 
     print(f"\n=====清洗完成=====")
-    print(f"成功保留基金: {cnt_ok} 只")
+    print(f"成功保留基金: {cnt_ok} 只（已含份额去重）")
     print(f"读取异常: {cnt_err_read} 只 | 清洗异常: {cnt_err_clean} 只")
-    print(f"清洗后为空剔除: {cnt_reject_empty} 只 | 历史太短剔除: {cnt_reject_short} 只")
+    print(f"清洗后为空剔除: {cnt_reject_empty} 只")
+    print(f"窗口覆盖不足剔除: {cnt_reject_short} 只 | 窗口尾部缺数据剔除: {cnt_reject_stale} 只")
+    print(f"同基金重复份额剔除: {cnt_reject_dup} 只")
     print(f"清洗报告输出至：{CLEAN_REPORT_PATH}")
     return df_report
 
