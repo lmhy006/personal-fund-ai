@@ -79,12 +79,12 @@ def probe_fund(csv_path: str) -> dict:
     dup_mask = df.duplicated(subset=["date"], keep=False)
     dup_date_cnt = dup_mask.sum()
 
-    # 可疑跳变：用nav计算日涨跌幅（去除nav为0和NaN的记录），|r|>0.2标记可疑（不删除，只计数）
-    df_sorted = df.sort_values("date").copy()
-    valid_mask = (~df_sorted["nav"].isna()) & (df_sorted["nav"] != 0)
-    df_sorted.loc[valid_mask, "r_calc"] = df_sorted.loc[valid_mask, "nav"].pct_change()
-    df_sorted.loc[~valid_mask, "r_calc"] = np.nan
-    jump_suspicious_cnt = ((df_sorted["r_calc"].abs() > 0.20)).sum()
+    # 可疑跳变：官方"日增长率"口径（与清洗口径一致，已含分红调整），|r|>20%只计数
+    if "日增长率" in df.columns:
+        dr = pd.to_numeric(df["日增长率"], errors="coerce") / 100.0
+        jump_suspicious_cnt = int((dr.abs() > 0.20).sum())
+    else:
+        jump_suspicious_cnt = 0
 
     return {
         "fund_code": fund_code,

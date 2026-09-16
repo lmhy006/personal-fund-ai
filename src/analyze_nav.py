@@ -1,8 +1,8 @@
 import os
-import math
 import numpy as np
 import pandas as pd
 import akshare as ak
+from scipy import stats as sps
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
@@ -43,6 +43,8 @@ def analyze_fund(df: pd.DataFrame, fund_code: str, bench_r: pd.Series) -> dict:
     注意：nav_acc不是复权净值，分红日对其pct_change会被稀释，故不再使用
     alpha/beta：基金日收益与沪深300日收益减去日频无风险利率后做OLS回归，
     beta为斜率，alpha为截距×252年化；样本不足MIN_REGRESSION_DAYS时记NaN
+    标准误为Newey-West HAC（Bartlett核），p值用t分布
+    口径说明：CAGR按真实自然年折算；波动/夏普/alpha年化按252交易日惯例
     :param df: 清洗后的净值df，列 date, nav, nav_acc, daily_ret
     :param fund_code: 基金代码
     :param bench_r: 基准日收益序列（date索引），可为None
@@ -61,8 +63,13 @@ def analyze_fund(df: pd.DataFrame, fund_code: str, bench_r: pd.Series) -> dict:
     nav_adj = (1.0 + r).cumprod()
     dates = df["date"]
 
-    # 年化收益：CAGR，按交易日折算
-    ann_return = float(nav_adj.iloc[-1] ** (TRADING_DAYS / n) - 1)
+    # 年化收益：CAGR，按真实自然年折算（end-start天数/365.25）
+    # 注意：不能用252/n观测数折算——实际每年披露数<252，会系统性高估CAGR
+    # 其余年化因子（波动/夏普/下行偏差/alpha×252）保持行业252交易日惯例，口径差异见docstring
+    years = float((dates.iloc[-1] - dates.iloc[0]).days / 365.25)
+    if years <= 0:
+        raise ValueError(f"窗口时间跨度异常：{years}年")
+    ann_return = float(nav_adj.iloc[-1] ** (1.0 / years) - 1)
 
     # 年化波动：日收益标准差年化
     ann_vol = float(r.std() * ANN_FACTOR)
@@ -120,18 +127,27 @@ def analyze_fund(df: pd.DataFrame, fund_code: str, bench_r: pd.Series) -> dict:
             x = (merged["r_b"] - RF_DAILY).values
             y = (merged["r_f"] - RF_DAILY).values
             beta, alpha_d = np.polyfit(x, y, deg=1)
-            # R² = 1 - SS_res/SS_tot
+            # R² = 1 - SS_res/SS_tot（OLS口径，不受标准误修正影响）
             ss_res = float(np.sum((y - (beta * x + alpha_d)) ** 2))
             ss_tot = float(np.sum((y - y.mean()) ** 2))
             r_squared = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
-            # alpha的t统计量：se_alpha = sqrt( σ² · (X'X)⁻¹[0,0] )，X=[1, x]
+            # alpha的t统计量：Newey-West HAC标准误（Bartlett核，修正异方差与自相关）
             X_mat = np.column_stack([np.ones(reg_days), x])
-            sigma2 = ss_res / (reg_days - 2)
-            se_alpha = float(np.sqrt(sigma2 * np.linalg.pinv(X_mat.T @ X_mat)[0, 0]))
+            u = y - (beta * x + alpha_d)  # OLS残差
+            lag_max = int(np.floor(4.0 * (reg_days / 100.0) ** (2.0 / 9.0)))  # NW经验滞后
+            XtX_inv = np.linalg.pinv(X_mat.T @ X_mat)
+            ux = X_mat * u[:, None]
+            S = ux.T @ ux
+            for j in range(1, lag_max + 1):
+                w = 1.0 - j / (lag_max + 1.0)
+                g = ux[:-j].T @ ux[j:]
+                S += w * (g + g.T)
+            V = XtX_inv @ S @ XtX_inv
+            se_alpha = float(np.sqrt(V[0, 0]))
             alpha_t = float(alpha_d / se_alpha) if se_alpha > 0 else np.nan
-            # p值正态近似（大样本t≈N(0,1)）：p = 2·(1-Φ(|t|))
+            # p值：t分布（df=reg_days-2）
             if np.isfinite(alpha_t):
-                alpha_p = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(alpha_t) / math.sqrt(2.0)))))
+                alpha_p = float(2.0 * sps.t.sf(abs(alpha_t), df=reg_days - 2))
             alpha_ann = float(alpha_d * TRADING_DAYS)
             beta = float(beta)
 

@@ -11,7 +11,8 @@ RAW_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 RAW_FUND_NAV_DIR = os.path.join(RAW_DATA_DIR, "fund_nav")
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed")
 TMP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_tmp")
-CLEAN_REPORT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "clean_report.csv")
+BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_backup")
+CLEAN_REPORT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed", "clean_report.csv")
 POOL_PATH = os.path.join(RAW_DATA_DIR, "phase0_fund_pool.csv")
 
 # 统一分析窗口：近 WINDOW_YEARS 年，锚点=全部基金最新净值日期（全局统一，避免各取"自己最后三年"造成窗口错位）
@@ -149,9 +150,10 @@ def clean_all():
     4. 【批量层】统一窗口校验：窗口起点覆盖不足 / 窗口尾部缺数据 的基金整只剔除
     5. 截断到统一窗口（近WINDOW_YEARS年），保证跨基金可比
     6. 【批量层】份额去重：同基金不同份额只保留代表份额（历史最长，并列优先A类）
-    7. 通过的基金写入临时目录，全部完成后整目录原子替换正式目录
-       （避免"先删旧再逐个写"中途失败留下半新半旧混批；最坏情况旧批次完整保留，tmp残留待下轮清理）
-    8. 输出clean_report.csv，记录全部基金状态（swap成功后才写，报告永远与processed配套）
+    7. 通过的基金写入临时目录，报告也写进临时目录；
+       全部完成后用backup让位法原子替换：正式目录先rename让位，tmp上位，失败则回滚
+       （任何时刻磁盘上都保留一份完整批次；成功后删除backup）
+    8. 输出clean_report.csv（随tmp一起交换，报告永远与processed同一批次）
     """
     # 幂等：清理上轮swap失败可能残留的临时目录，本轮先写tmp
     if os.path.exists(TMP_DIR):
@@ -251,6 +253,21 @@ def clean_all():
         clean_span = (df_win["date"].max() - df_win["date"].min()).days
         passed.append((fund_code, df_win, stat, clean_span))
 
+    # 严格统一窗口：取所有合格基金的共同起止日（最晚首日 ~ 最早末日），二次截断
+    # 保证横向排名时每只基金的窗口完全一致（0天差异），而不是依赖30天容差
+    if passed:
+        common_start = max(df["date"].min() for _, df, _, _ in passed)
+        common_end = min(df["date"].max() for _, df, _, _ in passed)
+        if (common_end - common_start).days < 1000:
+            print(f"⚠️ 共同窗口跨度异常：{common_start.date()} ~ {common_end.date()}，请人工检查数据")
+        print(f"严格共同窗口：{common_start.date()} ~ {common_end.date()}（全体基金一致）")
+        aligned = []
+        for fund_code, df_win, stat, _ in passed:
+            df_c = df_win[(df_win["date"] >= common_start) & (df_win["date"] <= common_end)].reset_index(drop=True)
+            span_c = (df_c["date"].max() - df_c["date"].min()).days
+            aligned.append((fund_code, df_c, stat, span_c))
+        passed = aligned
+
     # 份额去重：同基金不同份额只保留代表份额
     kept = dedup_shares(passed, report_list)
 
@@ -267,15 +284,25 @@ def clean_all():
         })
         print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 窗口内跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
 
-    # 原子替换：全部基金写盘成功后才用tmp整目录替换正式目录
-    # 同盘rename接近原子；若被占用失败则正式目录仍是完整旧批次，tmp残留待下轮清理
-    shutil.rmtree(PROCESSED_DIR)
-    os.rename(TMP_DIR, PROCESSED_DIR)
-    print(f"\nprocessed目录已原子替换：{PROCESSED_DIR}（{len(kept)} 只）")
-
-    # 输出清洗报告（覆盖旧报告；swap成功后才写，保证报告与processed配套）
+    # 报告写进临时目录，随swap一起生效，保证与processed同一批次
     df_report = pd.DataFrame(report_list)
-    df_report.to_csv(CLEAN_REPORT_PATH, index=False, encoding="utf-8-sig")
+    df_report.to_csv(os.path.join(TMP_DIR, "clean_report.csv"), index=False, encoding="utf-8-sig")
+
+    # 原子替换（backup让位法）：任何时刻磁盘上都保留一份完整批次
+    # 1) 正式目录原子让位为backup 2) tmp上位；失败则回滚让位（旧批次复位） 3) 成功后删backup
+    if os.path.exists(BACKUP_DIR):
+        shutil.rmtree(BACKUP_DIR)  # 清理上轮异常残留
+    if not os.path.exists(PROCESSED_DIR):
+        os.rename(TMP_DIR, PROCESSED_DIR)
+    else:
+        os.rename(PROCESSED_DIR, BACKUP_DIR)
+        try:
+            os.rename(TMP_DIR, PROCESSED_DIR)
+        except Exception:
+            os.rename(BACKUP_DIR, PROCESSED_DIR)  # 回滚：旧批次完整复位
+            raise
+        shutil.rmtree(BACKUP_DIR)
+    print(f"\nprocessed目录已替换：{PROCESSED_DIR}（{len(kept)} 只，报告随目录交换）")
 
     cnt_ok = (df_report["status"] == "ok").sum()
     cnt_err_read = (df_report["status"] == "error_read").sum()

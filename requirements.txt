@@ -1,0 +1,6 @@
+# fund_ai 环境依赖（Python 3.12 实测版本）
+akshare==1.18.94
+pandas==3.0.5
+numpy==2.5.1
+scipy==1.18.0
+matplotlib==3.11.1
