@@ -105,17 +105,19 @@ def load_benchmark_hs300(use_cache: bool = True) -> pd.DataFrame:
     print("[失败] 沪深300基准多次请求失败")
     return None
 
-def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False):
+def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
+                         pool_file: str = "fund_code_list.csv"):
     """
-    批量下载净值：读取 phase0_fund_pool.csv 基金池
+    批量下载净值：读取指定基金池（默认 fund_code_list.csv = 全量股票型+混合型）
     更新逻辑：先强制重拉基准（一次请求），以其最新日期为"最新交易日"锚点；
     基金缓存末日期落后锚点超过STALE_TOLERANCE_DAYS天则自动重拉，否则跳过
-    :param sleep_sec: 每只请求后休眠秒数，防止IP限流，建议1.5~3
+    :param sleep_sec: 每只请求后休眠秒数，防止IP限流，建议1.5~3；全量拉取建议2.0
     :param force_refresh: True则无视缓存全部重拉（数据源异常回补时用）
+    :param pool_file: data/raw 下的池文件名，phase0调试可用 "phase0_fund_pool.csv"
     """
-    pool_path = os.path.join(RAW_DATA_DIR, "phase0_fund_pool.csv")
+    pool_path = os.path.join(RAW_DATA_DIR, pool_file)
     if not os.path.exists(pool_path):
-        raise FileNotFoundError(f"找不到基金池文件：{pool_path}，请先生成phase0_fund_pool.csv")
+        raise FileNotFoundError(f"找不到基金池文件：{pool_path}，请先运行fund_list_loader.py")
 
     pool_df = pd.read_csv(pool_path, dtype={"基金代码": str})
     code_list = pool_df["基金代码"].astype(str).tolist()

@@ -141,11 +141,13 @@ def dedup_shares(passed: list, report_list: list) -> list:
     return kept
 
 
-def clean_all():
+def clean_all(pool_file: str = None):
     """
-    批量清洗全部基金
-    1. 【幂等】先清除processed目录下旧 fund_*.csv
-    2. 读取raw/fund_nav下面所有fund_*.csv
+    批量清洗基金净值
+    :param pool_file: data/raw下的池文件名（如 fund_dev_pool.csv）；None=清洗raw目录下全部基金
+    流程：
+    1. 【幂等】tmp目录就绪
+    2. 读取raw/fund_nav下面所有fund_*.csv（若指定pool_file则只清洗池内基金）
     3. 调用clean_fund做行层面清洗，捕获清洗阶段异常
     4. 【批量层】统一窗口校验：窗口起点覆盖不足 / 窗口尾部缺数据 的基金整只剔除
     5. 截断到统一窗口（近WINDOW_YEARS年），保证跨基金可比
@@ -155,6 +157,14 @@ def clean_all():
        （任何时刻磁盘上都保留一份完整批次；成功后删除backup）
     8. 输出clean_report.csv（随tmp一起交换，报告永远与processed同一批次）
     """
+    if pool_file is not None:
+        pool_path = os.path.join(RAW_DATA_DIR, pool_file)
+        if not os.path.exists(pool_path):
+            raise FileNotFoundError(f"找不到池文件：{pool_path}")
+        pool_codes = set(pd.read_csv(pool_path, dtype={"基金代码": str})["基金代码"].astype(str))
+        print(f"清洗范围限定为池文件 {pool_file}（{len(pool_codes)} 只）")
+    else:
+        pool_codes = None
     # 幂等：清理上轮swap失败可能残留的临时目录，本轮先写tmp
     if os.path.exists(TMP_DIR):
         shutil.rmtree(TMP_DIR)
@@ -163,6 +173,9 @@ def clean_all():
 
     report_list = []
     file_list = [f for f in os.listdir(RAW_FUND_NAV_DIR) if f.startswith("fund_") and f.endswith(".csv")]
+    if pool_codes is not None:
+        file_list = [f for f in file_list
+                     if f.replace("fund_", "").replace(".csv", "") in pool_codes]
     print(f"待清洗基金总数：{len(file_list)}")
 
     # 统一分析窗口锚点（全局一致，保证跨基金可比）
