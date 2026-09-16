@@ -13,7 +13,17 @@ PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed"
 TMP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_tmp")
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_backup")
 CLEAN_REPORT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed", "clean_report.csv")
-POOL_PATH = os.path.join(RAW_DATA_DIR, "phase0_fund_pool.csv")
+# 基金名称元数据：全量列表（任何池子都是其子集），不绑定本轮池文件
+FUND_META_PATH = os.path.join(RAW_DATA_DIR, "fund_code_list.csv")
+
+
+def load_fund_name_map() -> dict:
+    """基金代码 -> 简称 映射，来源为全量元数据列表；缺失文件返回空映射并警告"""
+    if not os.path.exists(FUND_META_PATH):
+        print(f"[警告] 基金元数据缺失：{FUND_META_PATH}，名称映射将不完整")
+        return {}
+    df = pd.read_csv(FUND_META_PATH, dtype={"基金代码": str})
+    return dict(zip(df["基金代码"], df["基金简称"].astype(str)))
 
 # 统一分析窗口：近 WINDOW_YEARS 年，锚点=全部基金最新净值日期（全局统一，避免各取"自己最后三年"造成窗口错位）
 WINDOW_YEARS = 3
@@ -100,21 +110,17 @@ def share_cluster_key(name: str) -> str:
     return SHARE_SUFFIX_RE.sub("", str(name).strip())
 
 
-def dedup_shares(passed: list, report_list: list) -> list:
+def dedup_shares(passed: list, report_list: list, name_map: dict) -> list:
     """
     份额去重（批量层）：同一基金不同份额只保留一个代表份额
     代表规则：簇内保留窗口内跨度最长者，并列时优先A类（简称尾部A），再按代码升序
     必须在行级清洗和窗口校验之后执行：先各自过质量关，再选代表，避免误杀整簇
     :param passed: [(fund_code, df_win, stat, span), ...] 已通过校验的基金
     :param report_list: 清洗报告列表，非代表份额在此追加 reject_duplicate_share 记录
+    :param name_map: 基金代码->简称 映射（由clean_all从全量元数据构建）
     :return: 代表份额列表 [(fund_code, df_win, stat, span), ...]
     """
-    # 名称来自基金池文件；缺失名称的基金各自独立成簇（code本身做key，不会误合并）
-    name_map = {}
-    if os.path.exists(POOL_PATH):
-        pool_df = pd.read_csv(POOL_PATH, dtype={"基金代码": str})
-        name_map = dict(zip(pool_df["基金代码"], pool_df["基金简称"].astype(str)))
-
+    # 缺失名称的基金各自独立成簇（code本身做key，不会误合并）
     clusters = {}
     for fund_code, df_win, stat, span in passed:
         name = name_map.get(fund_code, "")
@@ -172,6 +178,7 @@ def clean_all(pool_file: str = None):
     print(f"临时目录就绪：{TMP_DIR}\n")
 
     report_list = []
+    name_map = load_fund_name_map()  # 名称来自全量元数据，与本轮池文件无关
     file_list = [f for f in os.listdir(RAW_FUND_NAV_DIR) if f.startswith("fund_") and f.endswith(".csv")]
     if pool_codes is not None:
         file_list = [f for f in file_list
@@ -282,7 +289,7 @@ def clean_all(pool_file: str = None):
         passed = aligned
 
     # 份额去重：同基金不同份额只保留代表份额
-    kept = dedup_shares(passed, report_list)
+    kept = dedup_shares(passed, report_list, name_map)
 
     # 写入临时目录 + ok记录
     for fund_code, df_win, stat, clean_span in kept:
@@ -296,6 +303,10 @@ def clean_all(pool_file: str = None):
             "clean_date_span_days": clean_span
         })
         print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 窗口内跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
+
+    # 统一填充基金名称（来自全量元数据），报告与processed同批次携带名称快照
+    for rec in report_list:
+        rec.setdefault("fund_name", name_map.get(rec["fund_code"], ""))
 
     # 报告写进临时目录，随swap一起生效，保证与processed同一批次
     df_report = pd.DataFrame(report_list)

@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 import pandas as pd
 import akshare as ak
@@ -12,7 +13,27 @@ ANALYZE_DIR = os.path.join(PROJECT_ROOT, "data", "analyze")
 SUMMARY_PATH = os.path.join(ANALYZE_DIR, "analysis_summary.csv")
 CHART_DIR = os.path.join(ANALYZE_DIR, "charts")
 BENCHMARK_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "benchmark_hs300.csv")
-POOL_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "phase0_fund_pool.csv")
+CLEAN_REPORT_PATH = os.path.join(CLEAN_NAV_DIR, "clean_report.csv")
+FUND_META_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "fund_code_list.csv")
+
+
+def load_fund_name_map() -> dict:
+    """
+    基金代码 -> 简称 映射，两级来源：
+    1. 优先本批次 clean_report 的 fund_name 列（与processed同批次，快照一致）
+    2. 回退全量元数据 fund_code_list.csv（任何池子都是其子集）
+    """
+    if os.path.exists(CLEAN_REPORT_PATH):
+        rep = pd.read_csv(CLEAN_REPORT_PATH, dtype={"fund_code": str})
+        if "fund_name" in rep.columns:
+            m = dict(zip(rep["fund_code"], rep["fund_name"].fillna("")))
+            if any(v for v in m.values()):
+                return m
+    if os.path.exists(FUND_META_PATH):
+        df = pd.read_csv(FUND_META_PATH, dtype={"基金代码": str})
+        return dict(zip(df["基金代码"], df["基金简称"].astype(str)))
+    print(f"[警告] 名称来源缺失（clean_report与{FUND_META_PATH}均不可用），fund_name将为空")
+    return {}
 
 # 指标口径常量
 TRADING_DAYS = 252      # 年化交易日
@@ -253,13 +274,8 @@ def analyze_one(fund_code: str):
     df = pd.read_csv(path, parse_dates=["date"])
     info = analyze_fund(df, fund_code, bench_r)
 
-    # 名称来自基金池
-    fund_name = ""
-    if os.path.exists(POOL_PATH):
-        pool_df = pd.read_csv(POOL_PATH, dtype={"基金代码": str})
-        m = pool_df[pool_df["基金代码"] == fund_code]
-        if len(m) > 0:
-            fund_name = str(m["基金简称"].iloc[0])
+    # 名称来自元数据映射（批次快照优先，回退全量列表）
+    fund_name = load_fund_name_map().get(fund_code, "")
 
     print(f"\n===== {fund_name}({fund_code}) =====")
     print(f"窗口：{info['date_start']} ~ {info['date_end']}")
@@ -280,6 +296,40 @@ def analyze_one(fund_code: str):
     return info
 
 
+def remove_stale_charts(success_codes: set[str]) -> int:
+    """仅清理批量运行遗留的 fund_六位代码.png；先确认本轮图片完整。"""
+    if not os.path.isdir(CHART_DIR):
+        raise RuntimeError(f"图表目录不存在，跳过旧图清理：{CHART_DIR}")
+
+    expected = {f"fund_{code}.png" for code in success_codes}
+    chart_files = {
+        entry.name: entry.path
+        for entry in os.scandir(CHART_DIR)
+        if entry.is_file(follow_symlinks=False)
+        and re.fullmatch(r"fund_\d{6}\.png", entry.name)
+    }
+    missing = expected - chart_files.keys()
+    empty = {name for name in expected & chart_files.keys()
+             if os.path.getsize(chart_files[name]) == 0}
+    if missing or empty:
+        raise RuntimeError(
+            f"本轮图表校验失败，未清理旧图：缺失{len(missing)}张，空文件{len(empty)}张"
+        )
+
+    stale = chart_files.keys() - expected
+    for name in sorted(stale):
+        os.remove(chart_files[name])
+
+    remaining = {
+        entry.name for entry in os.scandir(CHART_DIR)
+        if entry.is_file(follow_symlinks=False)
+        and re.fullmatch(r"fund_\d{6}\.png", entry.name)
+    }
+    if remaining != expected:
+        raise RuntimeError("旧图清理后图表集合与本轮成功基金不一致")
+    return len(stale)
+
+
 def analyze_all():
     """
     批量分析：对 data/processed/fund_processed 下全部 fund_*.csv 做单基金分析
@@ -290,13 +340,11 @@ def analyze_all():
     file_list = [f for f in os.listdir(CLEAN_NAV_DIR) if f.startswith("fund_") and f.endswith(".csv")]
     print(f"待分析基金数量：{len(file_list)}")
 
-    # 名称来自基金池
-    name_map = {}
-    if os.path.exists(POOL_PATH):
-        pool_df = pd.read_csv(POOL_PATH, dtype={"基金代码": str})
-        name_map = dict(zip(pool_df["基金代码"], pool_df["基金简称"].astype(str)))
+    # 名称来自元数据映射（批次快照优先，回退全量列表）
+    name_map = load_fund_name_map()
 
     rows = []
+    success_codes = set()
     for fname in file_list:
         fund_code = fname.replace("fund_", "").replace(".csv", "")
         try:
@@ -309,6 +357,7 @@ def analyze_all():
             print(f"[{fund_code}] [FAIL] 分析失败 {str(e)[:80]}")
             continue
         rows.append(info)
+        success_codes.add(fund_code)
         print(f"[{fund_code}] [OK] 年化:{info['ann_return']:.2%} 波动:{info['ann_vol']:.2%} "
               f"夏普:{info['sharpe']:.2f} 最大回撤:{info['max_drawdown']:.2%} "
               f"alpha:{info['alpha_ann']:.2%} beta:{info['beta']:.2f}")
@@ -321,6 +370,11 @@ def analyze_all():
     df_sum.to_csv(SUMMARY_PATH, index=False, encoding="utf-8-sig")
 
     ok = df_sum.dropna(subset=["ann_return"])
+    if len(success_codes) == len(file_list):
+        removed = remove_stale_charts(success_codes)
+        print(f"图表校验通过：本轮{len(success_codes)}张，清理旧图{removed}张")
+    else:
+        print(f"[警告] 本轮有{len(file_list) - len(success_codes)}只基金失败，跳过旧图清理")
     print(f"\n===== 分析完成 =====")
     print(f"成功 {len(ok)} 只 / 失败 {len(df_sum) - len(ok)} 只")
     print(f"汇总表输出至：{SUMMARY_PATH}")
