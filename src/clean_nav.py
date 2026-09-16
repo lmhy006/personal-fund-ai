@@ -13,6 +13,11 @@ PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed"
 TMP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_tmp")
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed_backup")
 CLEAN_REPORT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "fund_processed", "clean_report.csv")
+# 全历史模式（ML数据源）输出路径
+HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_history")
+HISTORY_TMP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_history_tmp")
+HISTORY_BACKUP_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "fund_history_backup")
+HISTORY_REPORT_PATH = os.path.join(HISTORY_DIR, "clean_history_report.csv")
 # 基金名称元数据：全量列表（任何池子都是其子集），不绑定本轮池文件
 FUND_META_PATH = os.path.join(RAW_DATA_DIR, "fund_code_list.csv")
 
@@ -31,8 +36,12 @@ WINDOW_YEARS = 3
 EDGE_TOLERANCE_DAYS = 30
 # 可疑跳变阈值：单日涨跌幅绝对值
 JUMP_THRESHOLD = 0.20
+# 披露覆盖率门槛：窗口内有效净值观测数/同期基准交易日数，低于阈值视为低频披露（周频/月频）剔除
+COVERAGE_THRESHOLD = 0.95
 # 份额后缀正则：基金简称尾部单个份额字母（A/C/D/E/H/I/M），用于同基金不同份额聚类
 SHARE_SUFFIX_RE = re.compile(r"[ACDEHIM]$")
+# 基准数据路径（coverage分母：同期基准交易日数）
+BENCHMARK_PATH = os.path.join(RAW_DATA_DIR, "benchmark_hs300.csv")
 
 # 创建输出目录
 os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -85,6 +94,9 @@ def clean_fund(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     # 5. 基于官方日收益率标记可疑跳变，只标记，不删除（官方口径下不再有分红假跳变）
     df["suspicious_jump"] = df["daily_ret"].abs() > JUMP_THRESHOLD
     stat["suspicious_jump_cnt"] = int(df["suspicious_jump"].sum())
+
+    # 6. 零收益计数（QA报警指标，不作删除标准：低波动基金天然有真0收益日）
+    stat["zero_ret_cnt"] = int((df["daily_ret"] == 0).sum())
 
     stat["rows_after_clean"] = len(df)
     return df, stat
@@ -147,10 +159,12 @@ def dedup_shares(passed: list, report_list: list, name_map: dict) -> list:
     return kept
 
 
-def clean_all(pool_file: str = None):
+def clean_all(pool_file: str = None, window: str = "current"):
     """
     批量清洗基金净值
     :param pool_file: data/raw下的池文件名（如 fund_dev_pool.csv）；None=清洗raw目录下全部基金
+    :param window: "current"=三年严格共同窗口（Phase1分析视图，fund_processed/）；
+                   "full"=完整历史无窗口（Phase2面板数据源，fund_history/）
     流程：
     1. 【幂等】tmp目录就绪
     2. 读取raw/fund_nav下面所有fund_*.csv（若指定pool_file则只清洗池内基金）
@@ -162,6 +176,11 @@ def clean_all(pool_file: str = None):
        全部完成后用backup让位法原子替换：正式目录先rename让位，tmp上位，失败则回滚
        （任何时刻磁盘上都保留一份完整批次；成功后删除backup）
     8. 输出clean_report.csv（随tmp一起交换，报告永远与processed同一批次）
+
+    window="full"（ML数据源模式）：
+    - 保留完整历史，不做起止校验、coverage硬门槛、共同窗口截断（eligibility下沉到panel层时变判定）
+    - coverage_ratio按基金自身起止范围相对基准交易日数记录（只记不剔）
+    - 输出 data/processed/fund_history/ + clean_history_report.csv，供PanelBuilder使用
     """
     if pool_file is not None:
         pool_path = os.path.join(RAW_DATA_DIR, pool_file)
@@ -171,11 +190,26 @@ def clean_all(pool_file: str = None):
         print(f"清洗范围限定为池文件 {pool_file}（{len(pool_codes)} 只）")
     else:
         pool_codes = None
+
+    # 按模式选择输出路径：current=Phase1三年分析视图；full=ML全历史数据源
+    if window == "full":
+        out_dir = HISTORY_DIR
+        tmp_dir = HISTORY_TMP_DIR
+        backup_dir = HISTORY_BACKUP_DIR
+        report_path = HISTORY_REPORT_PATH
+    elif window == "current":
+        out_dir = PROCESSED_DIR
+        tmp_dir = TMP_DIR
+        backup_dir = BACKUP_DIR
+        report_path = CLEAN_REPORT_PATH
+    else:
+        raise ValueError(f"未知window模式：{window}（可选 current / full）")
+
     # 幂等：清理上轮swap失败可能残留的临时目录，本轮先写tmp
-    if os.path.exists(TMP_DIR):
-        shutil.rmtree(TMP_DIR)
-    os.makedirs(TMP_DIR, exist_ok=True)
-    print(f"临时目录就绪：{TMP_DIR}\n")
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+    print(f"临时目录就绪：{tmp_dir}\n")
 
     report_list = []
     name_map = load_fund_name_map()  # 名称来自全量元数据，与本轮池文件无关
@@ -185,9 +219,10 @@ def clean_all(pool_file: str = None):
                      if f.replace("fund_", "").replace(".csv", "") in pool_codes]
     print(f"待清洗基金总数：{len(file_list)}")
 
-    # 统一分析窗口锚点（全局一致，保证跨基金可比）
-    window_start, window_end = calc_window_anchor(file_list)
-    print(f"统一分析窗口：{window_start.date()} ~ {window_end.date()}（近{WINDOW_YEARS}年，边缘容差{EDGE_TOLERANCE_DAYS}天）\n")
+    # 统一分析窗口锚点（全局一致，保证跨基金可比；full模式无窗口概念，跳过）
+    if window == "current":
+        window_start, window_end = calc_window_anchor(file_list)
+        print(f"统一分析窗口：{window_start.date()} ~ {window_end.date()}（近{WINDOW_YEARS}年，边缘容差{EDGE_TOLERANCE_DAYS}天）\n")
 
     passed = []  # 暂存通过校验的基金，去重后统一写盘
 
@@ -242,40 +277,89 @@ def clean_all(pool_file: str = None):
             print(f"[{fund_code}] ⚠️ 清洗后为空，整只剔除")
             continue
 
-        # 批量层校验1：窗口覆盖起点——窗口起点容差之外才开始披露净值的基金，无法覆盖全窗口
-        first_date = df_clean["date"].min()
-        if first_date > window_start + pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
-            report_list.append({
-                "fund_code": fund_code,
-                "status": "reject_short_history",
-                "reason": f"窗口覆盖不足：首个净值日{first_date.date()} 晚于窗口起点{window_start.date()}+{EDGE_TOLERANCE_DAYS}天",
-                **stat,
-                "clean_date_span_days": 0
-            })
-            print(f"[{fund_code}] ⚠️ 覆盖不足{WINDOW_YEARS}年窗口（首日{first_date.date()}），整只剔除")
-            continue
+        # 批量层校验1/2（仅current模式）：窗口起止校验；full模式保留完整历史，eligibility下沉到panel层
+        if window == "current":
+            first_date = df_clean["date"].min()
+            if first_date > window_start + pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
+                report_list.append({
+                    "fund_code": fund_code,
+                    "status": "reject_short_history",
+                    "reason": f"窗口覆盖不足：首个净值日{first_date.date()} 晚于窗口起点{window_start.date()}+{EDGE_TOLERANCE_DAYS}天",
+                    **stat,
+                    "clean_date_span_days": 0
+                })
+                print(f"[{fund_code}] ⚠️ 覆盖不足{WINDOW_YEARS}年窗口（首日{first_date.date()}），整只剔除")
+                continue
 
-        # 批量层校验2：数据新鲜度——窗口尾部缺数据的基金（可能清盘/停披露），统一时点比较无意义
-        last_date = df_clean["date"].max()
-        if last_date < window_end - pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
-            report_list.append({
-                "fund_code": fund_code,
-                "status": "reject_stale_data",
-                "reason": f"窗口尾部缺数据：最后净值日{last_date.date()} 早于窗口终点{window_end.date()}-{EDGE_TOLERANCE_DAYS}天",
-                **stat,
-                "clean_date_span_days": 0
-            })
-            print(f"[{fund_code}] ⚠️ 窗口尾部缺数据（最后{last_date.date()}），整只剔除")
-            continue
+            last_date = df_clean["date"].max()
+            if last_date < window_end - pd.Timedelta(days=EDGE_TOLERANCE_DAYS):
+                report_list.append({
+                    "fund_code": fund_code,
+                    "status": "reject_stale_data",
+                    "reason": f"窗口尾部缺数据：最后净值日{last_date.date()} 早于窗口终点{window_end.date()}-{EDGE_TOLERANCE_DAYS}天",
+                    **stat,
+                    "clean_date_span_days": 0
+                })
+                print(f"[{fund_code}] ⚠️ 窗口尾部缺数据（最后{last_date.date()}），整只剔除")
+                continue
 
-        # 截断到统一窗口后暂存
-        df_win = df_clean[(df_clean["date"] >= window_start) & (df_clean["date"] <= window_end)].reset_index(drop=True)
-        clean_span = (df_win["date"].max() - df_win["date"].min()).days
-        passed.append((fund_code, df_win, stat, clean_span))
+            # 截断到统一窗口后暂存
+            df_out = df_clean[(df_clean["date"] >= window_start) & (df_clean["date"] <= window_end)].reset_index(drop=True)
+        else:
+            # full模式：完整历史，不截断
+            df_out = df_clean
+        clean_span = (df_out["date"].max() - df_out["date"].min()).days
+        passed.append((fund_code, df_out, stat, clean_span))
 
-    # 严格统一窗口：取所有合格基金的共同起止日（最晚首日 ~ 最早末日），二次截断
-    # 保证横向排名时每只基金的窗口完全一致（0天差异），而不是依赖30天容差
-    if passed:
+    # 批量层校验3：披露覆盖率——起止合规但中间稀疏的低频披露基金（周频/月频/长期停披露）必须挡掉
+    # 否则其"日收益"实际是跨多日区间收益，波动/夏普等年化指标全部失真
+    if window == "current":
+        # 分母：同期基准交易日数（基准文件缺失时回退全池披露日并集）；先剔低频再用幸存者定义共同窗口
+        bench_days = None
+        if os.path.exists(BENCHMARK_PATH):
+            bench = pd.read_csv(BENCHMARK_PATH, parse_dates=["date"])
+            bench_days = int(bench[(bench["date"] >= window_start) & (bench["date"] <= window_end)]["date"].nunique())
+        if bench_days is not None and bench_days > 2:
+            cov_total = bench_days
+        elif passed:
+            cov_total = int(pd.concat([df["date"] for _, df, _, _ in passed]).drop_duplicates().shape[0])
+        else:
+            cov_total = 1
+        filtered = []
+        for fund_code, df_win, stat, clean_span in passed:
+            cov_ratio = len(df_win) / cov_total
+            stat["coverage_ratio"] = cov_ratio  # QA指标：覆盖率随报告留存
+            # zero_ret_cnt 统一为窗口内口径（clean_fund里是全历史计数，避免两QA指标口径不一致）
+            stat["zero_ret_cnt"] = int((df_win["daily_ret"] == 0).sum())
+            if cov_ratio < COVERAGE_THRESHOLD:
+                report_list.append({
+                    "fund_code": fund_code,
+                    "status": "reject_low_coverage",
+                    "reason": f"披露覆盖率过低：{cov_ratio:.1%} < {COVERAGE_THRESHOLD:.0%}（窗口内{len(df_win)}条/基准{cov_total}个交易日），疑似周频/月频披露或长期停披露",
+                    **stat,
+                    "clean_date_span_days": clean_span
+                })
+                print(f"[{fund_code}] ⚠️ 披露覆盖率 {cov_ratio:.1%} 过低（{len(df_win)}条/{cov_total}日），整只剔除")
+                continue
+            filtered.append((fund_code, df_win, stat, clean_span))
+        passed = filtered
+    else:
+        # full模式：coverage按基金自身起止范围相对基准交易日数记录，只记不剔（eligibility在panel层滚动判定）
+        bench_dates = None
+        if os.path.exists(BENCHMARK_PATH):
+            bench_dates = pd.read_csv(BENCHMARK_PATH, parse_dates=["date"])["date"].sort_values().reset_index(drop=True)
+        for fund_code, df_out, stat, clean_span in passed:
+            f0, f1 = df_out["date"].min(), df_out["date"].max()
+            if bench_dates is not None:
+                cov_total_fund = int(((bench_dates >= f0) & (bench_dates <= f1)).sum())
+            else:
+                cov_total_fund = max(len(df_out), 1)
+            stat["coverage_ratio"] = len(df_out) / max(cov_total_fund, 1)
+            stat["zero_ret_cnt"] = int((df_out["daily_ret"] == 0).sum())
+
+    # 严格统一窗口（仅current模式）：取所有合格基金的共同起止日，二次截断
+    # 保证横向排名时每只基金的窗口完全一致（0天差异），而不是依赖30天容差；full模式不做共同窗口
+    if window == "current" and passed:
         common_start = max(df["date"].min() for _, df, _, _ in passed)
         common_end = min(df["date"].max() for _, df, _, _ in passed)
         if (common_end - common_start).days < 1000:
@@ -293,7 +377,7 @@ def clean_all(pool_file: str = None):
 
     # 写入临时目录 + ok记录
     for fund_code, df_win, stat, clean_span in kept:
-        out_path = os.path.join(TMP_DIR, f"fund_{fund_code}.csv")
+        out_path = os.path.join(tmp_dir, f"fund_{fund_code}.csv")
         df_win.to_csv(out_path, index=False, encoding="utf-8-sig")
         report_list.append({
             "fund_code": fund_code,
@@ -302,7 +386,7 @@ def clean_all(pool_file: str = None):
             **stat,
             "clean_date_span_days": clean_span
         })
-        print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 窗口内跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
+        print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
 
     # 统一填充基金名称（来自全量元数据），报告与processed同批次携带名称快照
     for rec in report_list:
@@ -310,23 +394,23 @@ def clean_all(pool_file: str = None):
 
     # 报告写进临时目录，随swap一起生效，保证与processed同一批次
     df_report = pd.DataFrame(report_list)
-    df_report.to_csv(os.path.join(TMP_DIR, "clean_report.csv"), index=False, encoding="utf-8-sig")
+    df_report.to_csv(os.path.join(tmp_dir, os.path.basename(report_path)), index=False, encoding="utf-8-sig")
 
     # 原子替换（backup让位法）：任何时刻磁盘上都保留一份完整批次
     # 1) 正式目录原子让位为backup 2) tmp上位；失败则回滚让位（旧批次复位） 3) 成功后删backup
-    if os.path.exists(BACKUP_DIR):
-        shutil.rmtree(BACKUP_DIR)  # 清理上轮异常残留
-    if not os.path.exists(PROCESSED_DIR):
-        os.rename(TMP_DIR, PROCESSED_DIR)
+    if os.path.exists(backup_dir):
+        shutil.rmtree(backup_dir)  # 清理上轮异常残留
+    if not os.path.exists(out_dir):
+        os.rename(tmp_dir, out_dir)
     else:
-        os.rename(PROCESSED_DIR, BACKUP_DIR)
+        os.rename(out_dir, backup_dir)
         try:
-            os.rename(TMP_DIR, PROCESSED_DIR)
+            os.rename(tmp_dir, out_dir)
         except Exception:
-            os.rename(BACKUP_DIR, PROCESSED_DIR)  # 回滚：旧批次完整复位
+            os.rename(backup_dir, out_dir)  # 回滚：旧批次完整复位
             raise
-        shutil.rmtree(BACKUP_DIR)
-    print(f"\nprocessed目录已替换：{PROCESSED_DIR}（{len(kept)} 只，报告随目录交换）")
+        shutil.rmtree(backup_dir)
+    print(f"\nprocessed目录已替换：{out_dir}（{len(kept)} 只，报告随目录交换）")
 
     cnt_ok = (df_report["status"] == "ok").sum()
     cnt_err_read = (df_report["status"] == "error_read").sum()
@@ -334,6 +418,7 @@ def clean_all(pool_file: str = None):
     cnt_reject_empty = (df_report["status"] == "reject_empty").sum()
     cnt_reject_short = (df_report["status"] == "reject_short_history").sum()
     cnt_reject_stale = (df_report["status"] == "reject_stale_data").sum()
+    cnt_reject_cov = (df_report["status"] == "reject_low_coverage").sum()
     cnt_reject_dup = (df_report["status"] == "reject_duplicate_share").sum()
 
     print(f"\n=====清洗完成=====")
@@ -341,8 +426,8 @@ def clean_all(pool_file: str = None):
     print(f"读取异常: {cnt_err_read} 只 | 清洗异常: {cnt_err_clean} 只")
     print(f"清洗后为空剔除: {cnt_reject_empty} 只")
     print(f"窗口覆盖不足剔除: {cnt_reject_short} 只 | 窗口尾部缺数据剔除: {cnt_reject_stale} 只")
-    print(f"同基金重复份额剔除: {cnt_reject_dup} 只")
-    print(f"清洗报告输出至：{CLEAN_REPORT_PATH}")
+    print(f"披露覆盖率过低剔除: {cnt_reject_cov} 只 | 同基金重复份额剔除: {cnt_reject_dup} 只")
+    print(f"清洗报告输出至：{report_path}")
     return df_report
 
 
