@@ -44,4 +44,9 @@ desktop.ini
 
 data/
 *.pdf
-README_FOR_HUMAN.md
+
+# Phase 2B 临时实验输出；完整逐月汇总与预测明细单独跟踪
+ml/experiments/*smoke*_monthly.csv
+ml/experiments/gbdt_v2[abcd]_monthly.csv
+ml/experiments/gbdt_v2align_[abcd]_monthly.csv
+ml/experiments/preds_gbdt_v2align_[abcd]_monthly.csv

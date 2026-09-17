@@ -47,6 +47,25 @@ class Fold:
     meta: dict                   # 审计信息（train_label_end_max = 该轮最晚可用的答案日期）
 
 
+def nw_tstat(x, lags: int = 6) -> float:
+    """Newey-West HAC t 检验（均值=0，Bartlett 核）。
+
+    标签重叠修正（2026-09-17 审查确立）：6 个月标签逐月重叠 5 个月 → 月度 IC 序列
+    lag1 自相关实测 0.6~0.8、n_eff≈40~50，naive t 高估约 2.3 倍——
+    **一切正式显著性判定一律用本函数**（与 analyze_nav 的 HAC 口径同族），naive t 仅存档。"""
+    x = np.asarray(pd.Series(x).dropna(), dtype=float)
+    n = len(x)
+    if n < 5:
+        return float("nan")
+    e = x - x.mean()
+    s = 0.0
+    for l in range(1, min(lags, n - 1) + 1):
+        w = 1.0 - l / (lags + 1)
+        s += 2.0 * w * float(np.dot(e[l:], e[:-l])) / n
+    var = (float(np.dot(e, e)) / n + s) / n
+    return float(x.mean() / np.sqrt(var)) if var > 0 else float("nan")
+
+
 class WalkForwardSplitter:
     """逐月末 walk-forward 切分器。
 

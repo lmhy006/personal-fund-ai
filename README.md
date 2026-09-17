@@ -1,6 +1,6 @@
 # fund_ai
 
-A股公募基金（股票型 + 混合型）数据分析与选基 pipeline：数据拉取 → 探查 → 清洗 → 指标分析 → 图表输出 → 研究样本构建 → 面板数据集。当前完成 **Phase 1**（基金评价系统全链路）、**Phase 1.5**（研究池与数据集建设）与 **Phase 2A**（walk-forward 切分器 + 基线 Rank IC：近一年收益排序 IC=0.093 / 夏普排序 0.085，短历史段与长历史段量级接近）。**Phase 2B 已开工**：E1/E2/E1b 线性实验完成——全特征 Ridge 被单动量基线显著击败（IC 0.021 vs 0.093，配对 t=-4.1），消融定位风险类特征为污染源（控制动量后偏相关为负，秩标签不救）；**线性多因子无增量，单动量 IC=0.093 为待打基线**；下一步 E3 树模型（非线性交互）→ E4 年龄分层 → holdout 终审。
+A股公募基金（股票型 + 混合型）数据分析与选基 pipeline：数据拉取 → 探查 → 清洗 → 指标分析 → 图表输出 → 研究样本构建 → 面板数据集。当前完成 **Phase 1**（基金评价系统全链路）、**Phase 1.5**（研究池与数据集建设）与 **Phase 2A**（walk-forward 切分器 + 基线 Rank IC：近一年收益排序 IC=0.093 / 夏普排序 0.085，短历史段与长历史段量级接近）。**Phase 2B**：E1/E2/E1b 线性 + E3 树模型实验完成，经统计审查修正（NW t，n_eff≈42）后所有模型均无增量；runner 对齐评估与逐基金预测留存已完成（对齐后结论不变：单因子 Ridge 与基线完全重合 NW+0.73、树 NW-1.81 不显著）；**战略选择已拍板（2026-09-17）：接受动量基线（近一年收益排序）为第一版候选策略**——特征扩充列独立路线不阻塞；**E4 年龄检验完成**：动量对短/长历史段均适用（组内 IC +0.098/+0.082，NW 均显著）、Top 组年龄构成存在 +4.95pp 系统偏差（NW +2.59，须分段披露）但分层排序无收益增量（NW -0.92）→ **不训练年龄专用模型**；下一步 holdout 终审 → Phase 3 组合优化；不足一年基金评分方案仍待解决。
 
 ## 环境搭建
 
@@ -26,6 +26,8 @@ fund_ai/
 │   ├── panel_builder.py       # Phase2数据集：fund-month面板（特征≤t信息 + 未来6月标签 + 时变eligibility）
 │   ├── walk_forward_splitter.py    # Phase2A：逐月末walk-forward切分（label_end+lag<T）+ 防泄漏断言 + holdout隔离 + 基线RankIC
 │   ├── model_ridge.py              # Phase2B：Ridge实验runner（折内调参纪律 + 特征消融 + 标签模式）
+│   ├── model_gbdt.py               # Phase2B：LightGBM实验runner（原生NaN走分支 + 折内早停纪律：rmse/ic两种准则）
+│   ├── e4_age_check.py             # E4：主策略年龄适用性/跨段可比性/分层增量空间检验（纯评估无模型）
 │   ├── run_dev_download_clean.py    # 开发池拉取+清洗驱动（后台挂机用）
 │   └── run_full_download_clean.py   # 全量拉取+清洗驱动（phase2正式实验前用）
 ├── data/
@@ -38,7 +40,7 @@ fund_ai/
 └── ml/
     ├── panel.parquet          # fund-month面板（126,124行/1499只/278个月末截面 2003-01~2026-02）
     ├── wf_splits/             # Phase2A：wf_manifest.csv（逐折切分审计）+ baseline_rankic.csv（基线RankIC逐月明细）
-    ├── experiments/           # Phase2B：ridge_{tag}_monthly.csv 各实验变体逐月明细
+    ├── experiments/           # Phase2B：ridge_{tag}/gbdt_{tag}_monthly.csv 各实验变体逐月明细
     └── scores/                # （预留）每月正式评分快照，积累向前验证记录
 ```
 
@@ -71,10 +73,15 @@ python src/walk_forward_splitter.py                                 # 仅生成�
 python src/walk_forward_splitter.py --baseline ret_12m,sharpe_12m   # 基线：近一年收益/夏普排序的月度 Rank IC
 # 最终验收才打开 holdout（单独落盘，只允许跑一次）：--include-holdout
 
-# 8. Phase2B 模型实验（Ridge；--features/--label-mode/--tag 生成消融变体）
-python src/model_ridge.py                                        # E1 全特征
+# 8. Phase2B 模型实验（--features/--label-mode/--tag 生成消融变体）
+python src/model_ridge.py                                        # E1 Ridge 全特征
 python src/model_ridge.py --features ret_12m --tag r12only       # E2 消融示例
 python src/model_ridge.py --label-mode rank --tag rank_full      # E1b 秩标签
+python src/model_gbdt.py --tag v1                                # E3 LightGBM（rmse早停）
+python src/model_gbdt.py --early-stop ic --tag v2_icstop         # E3 v2（IC早停）
+python src/e4_age_check.py                                        # E4 主策略年龄检验（纯评估）
+# 所有 runner 默认：IC/Top 与基线同在 ret_12m 非缺失行上算（对齐评估），
+# 且逐基金预测留存 ml/experiments/preds_{runner}_{tag}_monthly.csv（评估与训练解耦）
 ```
 
 ## 指标口径（重要）
@@ -127,15 +134,17 @@ python src/model_ridge.py --label-mode rank --tag rank_full      # E1b 秩标签
 
 | 口径 | 说明 |
 |---|---|
-| 训练标签 | 默认**月内去均值**（y'=y-当月横截面均值，"实力=相对当期同伴"，剥离市场+风格共同成分，免疫基准错配）；`--label-mode rank` 月内秩变换（E1b 诊断）。IC 评估与任何月内平移口径等价；组合收益报绝对/相对300/相对全池三口径 |
-| 超参纪律 | Ridge alpha 网格 logspace(-3,3,13)：折内早段拟合（标准化统计只见早段）+ 尾部 24 个月揭晓段按月度 IC 选优 → 全训练折重拟合；只用 ≤T 信息 |
-| 评估与判定 | 月度 Rank IC + Top20% 等权三口径收益（相邻月标签重叠 5 个月→组合层统计偏乐观，正式换手/费用回测属 Phase 3）；模型 vs 基线**同月配对差 t 检验**，IC 均值高低不作数 |
+| 训练标签 | 默认**月内去均值**（y'=y-当月横截面均值）；它去掉当月全池共同水平，**不是风格调整**，不能据此衡量经理能力。`--label-mode rank` 是月内秩变换（E1b 诊断）。IC 评估与月内平移口径等价；组合收益报绝对/相对300/相对全池三口径 |
+| 超参纪律 | Ridge alpha 网格 logspace(-3,3,13)：折内早段拟合（标准化统计只见早段）+ 尾部 24 个月揭晓段按月度 IC 选优 → 全训练折重拟合；只用 ≤T 信息。GBDT：固定保守超参组 + 折内早停（同尾部验证段），`--early-stop rmse/ic` 两种准则 |
+| GBDT 特征处理 | **不标准化、不填补**——LightGBM 分裂原生处理 NaN（缺失进默认分支），ret_12m 的 1486 个新基金缺失行直接交给树学；无拟合状态＝无预处理泄漏面 |
+| GBDT 成本参数 | v1：lr=0.05/上限2000轮/耐心100 + rmse早停（轮数中位4）；v2 原参数：与 v1 完全相同参数、**只换 IC 早停**（轮数中位9，部分折跑满2000轮上限；唯一差异＝早停准则，干净对照）；v2 受控参数：lr=0.1/上限400轮/耐心50 + IC早停（228折分4片并行后合并，作参数稳健性对照） |
+| 评估与判定 | 月度 Rank IC + Top20% 等权三口径收益（相邻月标签重叠 5 个月→组合层统计偏乐观，正式换手/费用回测属 Phase 3）；模型 vs 基线同月配对差 t 检验。**标签重叠修正（审查升级）**：6 月标签逐月重叠 5 个月 → IC 序列 lag1 自相关 0.6~0.8、n_eff≈40~50（naive t 高估约 2.3 倍）——**正式判定一律用 Newey-West HAC t（lag=6）**，naive t 仅存档 |
 
-**实验结论（dev folds 228 折，基线 ret_12m IC=0.0934 / sharpe_12m IC=0.0852）**
+**首轮实验记录（dev folds 228 折；本表 IC 未做评估行对齐、t 为 naive 值，正式判定见下方对齐评估与 NW(6)）**
 
-| 实验 | 特征集 | 标签 | IC | vs ret_12m 基线配对 t |
+| 实验 | 特征集 | 标签 | 旧版 IC | vs ret_12m 基线 naive t |
 |---|---|---|---|---|
-| E1 | 全 10 特征 | demean | 0.021 | **-4.07 显著更差** |
+| E1 | 全 10 特征 | demean | 0.021 | -4.07（正式判定已改为边缘） |
 | E2 | 单因子 ret_12m | demean | 0.092 | -0.64 ≈ 基线（管线自证） |
 | E2 | 纯动量族(1m/3m/6m/12m) | demean | 0.076 | -1.23 无显著差异 |
 | E2 | 动量+风险(sharpe/vol/mdd) | demean | **-0.045** | **-7.53 反号** |
@@ -143,8 +152,38 @@ python src/model_ridge.py --label-mode rank --tag rank_full      # E1b 秩标签
 | E2 | 动量+age_months | demean | 0.052 | -2.74 |
 | E1b | 全 10 特征 | rank | 0.011 | -5.69 |
 | E1b | 动量+风险组 | rank | -0.068 | -8.70 |
+| E3 | 全 10 特征（LightGBM, rmse早停） | demean | 0.029 | -3.31 |
+| E3 | 全 10 特征（LightGBM, IC早停·原参数） | demean | 0.026 | -3.63 |
+| E3 | 全 10 特征（LightGBM, IC早停·受控参数分片） | demean | 0.030 | -3.37 |
+| E3 | 单因子 ret_12m（树） | demean | -0.009 | -5.56（诊断：早停对单特征树过保守，stump 近乎常数，非公平审判） |
 
-**研究发现**：① 面板真实信号集中在近一年动量，IC=0.093（t=6.2）；② 控制动量后，风险类特征（vol/sharpe/mdd）**偏相关为负**——同等过去收益下，高波基金未来半年占优；夏普基线的正 IC 全部来自其与动量的相关；③ 共线性下 MSE/Ridge 把权重摊到反向特征上，全特征线性模型系统性崩溃，秩标签（修复重尾）不救——**线性多因子无增量**；④ 下一步 E3 树模型：树按分裂贪婪选特征、不被共线性摊薄，验证非线性交互能否从风险/年龄特征中榨出超过 0.093 的增量。
+**显著性修正注记（2026-09-17 审查：表中 t 为 naive 值，标签重叠致高估约 2.3 倍）**
+
+| 实验 | naive t | AR1 t | **NW(6) t** | 修正后判定 |
+|---|---|---|---|---|
+| ridge_v1 全特征 | -4.07 | -1.31 | **-2.02** | 边缘更差 |
+| ridge 动量+风险组 | -7.53 | -2.91 | **-4.01** | **显著更差（稳健）** |
+| gbdt_v1 / v2_icstop / v2 | -3.3~-3.6 | -1.4~-1.5 | **-1.7~-1.9** | **不显著——"显著更差"收回，改判无增量** |
+| gbdt 单因子树 | -5.56 | -2.67 | **-3.06** | 显著更差（诊断性质保留） |
+| 基线 ret_12m vs 0 | +6.18 | +2.65 | **+3.37** | **信号仍显著（但 n_eff≈42，置信度打折）** |
+
+**对齐评估复核（2026-09-17，runner 升级：IC/Top 与基线同在 ret_12m 非缺失行上算，并逐基金预测留存 `preds_*.csv` 约 10.8 万行/实验）**：单因子 Ridge IC 0.0947 vs 基线 0.0934（配对差 +0.0013，NW +0.73）——**对齐后自证精确到噪声级**；全特征 Ridge 0.019（NW -2.08 边缘）；LightGBM ic早停 0.029（NW **-1.81 不显著**）。对齐不改变任何结论（每月差中位 2 行的规模），审查点①的量化判断最终确认。
+
+## 主策略年龄检验与战略选择（2026-09-17）
+
+**战略选择（已拍板）**：接受**动量基线（近一年收益排序）为第一版候选策略**。依据：修正后仍显著（NW +3.37）、单因子 Ridge 对齐后与基线完全重合（管线自证精确到噪声级）、线性/树模型在 NW 口径下均无增量、E4 证明其对两个年龄段适用——**不为进入下一阶段而强迫 ML 打赢基线**；特征扩充（规模/换手/经理/持仓，需新数据源）列为独立路线，同时是"经理能力"研究目标的前提，不阻塞 Phase 3。
+
+**E4 年龄检验（`src/e4_age_check.py`，纯评估层，dev folds 对齐行）**
+
+| 问题 | 结果 | NW 判定 |
+|---|---|---|
+| 适用性：组内动量 IC | short(12-36月) **+0.098** / full(≥36月) **+0.082** | 均显著（+3.21 / +2.90）；组间差不显著（-0.015，-0.66） |
+| 跨段可比性：Top20 组年龄构成 | short 占比偏差 **+4.95pp** | **+2.59 显著——动量排序系统性偏向新基金进 Top 组** |
+| 分层增量空间：组内排序−全池排序 Top 收益 | **-0.11%** | -0.92 不显著 → **不训练年龄专用模型** |
+
+结论：开发池中两个年龄段的动量 IC 都为正；当前**未检出**按年龄分别取 Top20 的收益增量，故第一版统一排行。Top 组的年龄构成有系统差异，排行榜决定分年龄段披露，方便解读；不足一年基金不在面板 eligibility 内，**全量正式评分前须另行解决**（低置信度或另设输入）。
+
+**补充诊断与边界：**动量基线在四个开发期历史段的平均 IC 均为正（0.066 / 0.091 / 0.126 / 0.091）；按过去 beta 粗分的三组内，动量 IC 也均为正（0.064 / 0.130 / 0.110）。这些结果表明信号不只是跨粗 beta 组排序，**尚不能证明已消除所有风格影响**。单因子树的大量折只训练一轮，产生较多并列预测；这是当前树配置的诊断结果，不能推广成“树模型不能做自证”。评估行对齐、E4 和主策略选择现均已完成，结果以上述较新的对齐评估及 E4 段落为准。
 
 ## 输出物
 
@@ -156,6 +195,9 @@ python src/model_ridge.py --label-mode rank --tag rank_full      # E1b 秩标签
 - `ml/wf_splits/wf_manifest.csv`：逐月末切分审计（train/test 规模、train_label_end_max＝该轮最晚揭晓的答案日期、ok/skipped/reserved 状态），防泄漏可复核
 - `ml/wf_splits/baseline_rankic.csv`：基线 Rank IC 逐月长表（截面 × 特征 × 年龄组），Phase2B 模型的对照底线
 - `ml/experiments/ridge_{tag}_monthly.csv`：Phase2B 各实验变体逐折明细（模型IC/双基线IC/Top20三口径收益/折内选定alpha/训练规模与最晚标签日），配对 t 检验打印于控制台
+- `ml/experiments/gbdt_{tag}_monthly.csv`：同上（列 `n_rounds`/`valid_ic` 记录折内早停轮数与验证段月度IC）。提交的完整实验汇总为 `gbdt_v1`、`gbdt_v2_icstop`、`gbdt_v2`、`gbdt_v2align` 和 `gbdt_r12only`；分片与冒烟文件是本地中间产物。
+- `ml/experiments/preds_{ridge,gbdt}_{tag}_monthly.csv`：逐基金预测留存（fund_code/t_date/age_months/ret_12m/sharpe_12m/y/pred，全体行含缺失）——评估与训练解耦，任何口径（对齐/分年龄/分位组）可离线重算，不必重跑模型
+- `ml/experiments/e4_age_check_monthly.csv`：E4 逐月明细（全池/组内 IC、Top 组年龄构成、组内 vs 全池 Top 收益）
 
 ## 数据层约定
 

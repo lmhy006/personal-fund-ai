@@ -27,7 +27,7 @@ import pandas as pd
 from scipy import stats
 
 from walk_forward_splitter import (WalkForwardSplitter, FoldPreprocessor, rank_ic,
-                                    MIN_TEST_ROWS_FOR_IC, LABEL_COL)
+                                    MIN_TEST_ROWS_FOR_IC, LABEL_COL, nw_tstat)
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
@@ -116,12 +116,19 @@ def paired_t(diff: pd.Series) -> tuple:
 
 
 def run_experiment(panel: pd.DataFrame, phase: str = "dev", features: list = None,
-                  label_mode: str = "demean") -> pd.DataFrame:
+                   label_mode: str = "demean", limit: int = 0) -> tuple:
+    """返回 (逐月汇总明细, 逐基金预测明细)。
+
+    评估行对齐（2026-09-17 审查落实）：基线按 ret_12m 非缺失行排序打分，模型 IC/Top
+    也在**同一行集**上算——同月同基金严格可比。逐基金预测留存全体行（含 ret_12m 缺失
+    行，上线语义），任何评估口径可离线重算，不必重跑模型。"""
     features = features or FEATURES
     spl = WalkForwardSplitter(panel)
     bench = bench_future_6m()
-    rows = []
+    rows, pred_rows = [], []
     for fold in spl.folds(phase):
+        if limit and len(rows) >= limit:
+            break
         alpha_sel, sel_info = select_alpha(fold.train, features, label_mode)
         # 最终拟合：全训练折（标准化统计含全部已揭晓训练行）
         pre = FoldPreprocessor().fit(fold.train, features)
@@ -129,15 +136,21 @@ def run_experiment(panel: pd.DataFrame, phase: str = "dev", features: list = Non
                           label_values(fold.train, label_mode), alpha_sel)
         test = fold.test.assign(_pred=pre.transform(fold.test).to_numpy() @ beta)
 
-        ic_model, n = rank_ic(test, "_pred")
-        ic_base_r12, _ = rank_ic(fold.test, "ret_12m")
-        ic_base_sh, _ = rank_ic(fold.test, "sharpe_12m")
-        # Top20% 等权（gross；标签重叠5个月，t统计偏乐观，汇总注明）
-        k = max(1, int(round(len(test) * 0.2)))
-        order = test.sort_values("_pred", ascending=False)
+        # 逐基金预测留存（全体行——上线语义；对齐/分年龄/分位等口径均可离线重算）
+        pred_rows.append(fold.test[["fund_code", "t_date", "age_months", "ret_12m",
+                                    "sharpe_12m", LABEL_COL]].assign(
+            pred=test["_pred"].to_numpy(), phase=fold.phase))
+        # —— 对齐行集：与基线同月同基金（ret_12m 非缺失）——
+        test_al = test[test["ret_12m"].notna()]
+        ic_model, n = rank_ic(test_al, "_pred")
+        ic_base_r12, _ = rank_ic(test_al, "ret_12m")
+        ic_base_sh, _ = rank_ic(test_al, "sharpe_12m")
+        # Top20% 等权（对齐行集，gross；标签重叠5个月，t统计偏乐观，汇总注明）
+        k = max(1, int(round(len(test_al) * 0.2)))
+        order = test_al.sort_values("_pred", ascending=False)
         top20 = float(order.head(k)[LABEL_COL].mean())
         bot20 = float(order.tail(k)[LABEL_COL].mean())
-        pool = float(test[LABEL_COL].mean())
+        pool = float(test_al[LABEL_COL].mean())
         b6 = float(bench.reindex([fold.t]).iloc[0]) if fold.t in bench.index else float("nan")
 
         rows.append({
@@ -149,20 +162,22 @@ def run_experiment(panel: pd.DataFrame, phase: str = "dev", features: list = Non
             "train_rows": fold.meta["train_rows"],
             "train_label_end_max": fold.meta["train_label_end_max"],
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), (pd.concat(pred_rows, ignore_index=True)
+                                if pred_rows else pd.DataFrame())
 
 
 def print_summary(df: pd.DataFrame) -> None:
     eff = df[df["n_test"] >= MIN_TEST_ROWS_FOR_IC]
-    print(f"\n=== Ridge v1 vs 基线（dev folds，有效月 n≥{MIN_TEST_ROWS_FOR_IC}：{len(eff)} 个月）===")
+    print(f"\n=== Ridge vs 基线（dev folds，对齐评估行，有效月 n≥{MIN_TEST_ROWS_FOR_IC}：{len(eff)} 个月）===")
     m_ic = eff["ic_model"].mean()
     print(f"模型  RankIC: mean={m_ic:.4f}  std={eff['ic_model'].std():.4f}  "
           f"IC>0占比={( eff['ic_model'] > 0).mean():.2f}")
     for base_col, base_name in [("ic_base_ret12", "ret_12m 基线"), ("ic_base_sharpe", "sharpe 基线")]:
         b_ic = eff[base_col].mean()
         n, dm, t, p = paired_t(eff["ic_model"] - eff[base_col])
-        print(f"vs {base_name}: base_IC={b_ic:.4f} | 配对差={dm:+.4f}  t={t:+.2f}  p={p:.3f}"
-              f"{'  ← 显著优于基线' if (t > 1.96 and p < 0.05) else ''}")
+        t_nw = nw_tstat(eff["ic_model"] - eff[base_col])
+        print(f"vs {base_name}: base_IC={b_ic:.4f} | 配对差={dm:+.4f}  naive t={t:+.2f}  "
+              f"NW t={t_nw:+.2f}{'  ← 显著优于基线（NW 判定）' if t_nw > 1.96 else ''}")
     # 组合层（三口径，6个月收益均值；标签重叠5个月→t统计偏乐观，仅作量级参考）
     top = eff["top20_ret"].mean()
     pool = eff["pool_ret"].mean()
@@ -183,6 +198,7 @@ def main():
     ap.add_argument("--label-mode", default="demean", choices=["demean", "rank"],
                     help="训练标签：demean=月内去均值（默认）；rank=月内秩变换（E1b）")
     ap.add_argument("--tag", default="v1", help="产物文件名标签（ridge_{tag}_monthly.csv）")
+    ap.add_argument("--limit", type=int, default=0, help="只跑前 N 折（冒烟测试用）")
     ap.add_argument("--include-holdout", action="store_true",
                     help="打开最终 holdout（只允许最终验收跑一次；结果单独落盘）")
     args = ap.parse_args()
@@ -196,12 +212,16 @@ def main():
     if args.include_holdout:
         print("!!! 正在打开最终 holdout —— 只允许在全部实验拍板后的最终验收时运行一次 !!!")
     print(f"特征集({len(features)}): {features} | 标签模式: {args.label_mode}")
-    df = run_experiment(panel, phase, features, args.label_mode)
+    df, preds = run_experiment(panel, phase, features, args.label_mode, args.limit)
     os.makedirs(OUT_DIR, exist_ok=True)
-    fname = f"ridge_{args.tag}_{'holdout' if args.include_holdout else 'monthly'}.csv"
-    fpath = os.path.join(OUT_DIR, fname)
+    suffix = "holdout" if args.include_holdout else "monthly"
+    fpath = os.path.join(OUT_DIR, f"ridge_{args.tag}_{suffix}.csv")
     df.to_csv(fpath, index=False)
     print(f"逐月明细已落盘: {fpath}（{len(df)} 折）")
+    if len(preds):
+        ppath = os.path.join(OUT_DIR, f"preds_ridge_{args.tag}_{suffix}.csv")
+        preds.to_csv(ppath, index=False)
+        print(f"逐基金预测留存: {ppath}（{len(preds)} 行，全体行含 ret_12m 缺失）")
     print_summary(df)
     if not args.include_holdout:
         print("\nholdout 未触碰：全部实验拍板后加 --include-holdout 做最终验收")
