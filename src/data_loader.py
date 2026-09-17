@@ -106,14 +106,21 @@ def load_benchmark_hs300(use_cache: bool = True) -> pd.DataFrame:
     return None
 
 def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
-                         pool_file: str = "fund_code_list.csv"):
+                         pool_file: str = "fund_code_list.csv", backfill: bool = False):
     """
     批量下载净值：读取指定基金池（默认 fund_code_list.csv = 全量股票型+混合型）
-    更新逻辑：先强制重拉基准（一次请求），以其最新日期为"最新交易日"锚点；
-    基金缓存末日期落后锚点超过STALE_TOLERANCE_DAYS天则自动重拉，否则跳过
+
+    两种模式（2026-09-17 增补 backfill，区分"日常增量"与"长任务回填"）：
+      日常增量（默认）：以基准最新日为锚点，缓存末日期落后超过 STALE_TOLERANCE_DAYS 天才重拉——
+        容忍基金净值 T+1 披露与周末滞后，避免每天全量重拉。
+      回填（backfill=True）：**已有缓存一律跳过，只为缺失缓存拉取**。
+        为什么必须分开：锚点随日期前进，多天长任务（全量 universe 补拉 9661 只，需数小时至
+        十几小时）若按新鲜度判断，前一天的进度会在 3 天后被判"过期"而重拉，长任务无法收敛。
+        回填完成后如要让缓存跟上最新净值，再用日常增量模式跑一次即可。
     :param sleep_sec: 每只请求后休眠秒数，防止IP限流，建议1.5~3；全量拉取建议2.0
     :param force_refresh: True则无视缓存全部重拉（数据源异常回补时用）
     :param pool_file: data/raw 下的池文件名，phase0调试可用 "phase0_fund_pool.csv"
+    :param backfill: 回填模式：只拉缺失缓存，已有缓存跳过（长任务断点续传）
     """
     pool_path = os.path.join(RAW_DATA_DIR, pool_file)
     if not os.path.exists(pool_path):
@@ -121,12 +128,19 @@ def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
 
     pool_df = pd.read_csv(pool_path, dtype={"基金代码": str})
     code_list = pool_df["基金代码"].astype(str).tolist()
-    print(f"准备批量下载，基金总数：{len(code_list)}，force_refresh={force_refresh}")
+    print(f"准备批量下载，基金总数：{len(code_list)}，force_refresh={force_refresh}，backfill={backfill}")
 
     # 先更新基准（一次请求，成本低），其最新日期作为缓存新鲜度锚点
     bench_df = load_benchmark_hs300(use_cache=False)
     stale_before = None
-    if force_refresh:
+    if backfill:
+        # 回填：只拉缺失——已有缓存一律跳过（不判新鲜度，避免长任务进度被锚点前进吞掉）
+        missing = [c for c in code_list
+                   if not os.path.exists(os.path.join(NAV_DATA_DIR, f"fund_{c}.csv"))]
+        print(f"回填模式：已有缓存 {len(code_list) - len(missing)} 只跳过，"
+              f"待拉缺失 {len(missing)} 只（断点续传：中断后重跑自动接着拉）")
+        code_list = missing
+    elif force_refresh:
         stale_before = None  # force模式下全部走强制下载，不需要锚点
     elif bench_df is not None:
         stale_before = bench_df["date"].max()
@@ -152,5 +166,13 @@ def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
     print(f"成功:{success}  失败:{fail}")
 
 if __name__ == "__main__":
-    # 运行本脚本，则执行批量下载；force_refresh=True时全量强刷
-    batch_download_funds(sleep_sec=1.5)
+    import argparse
+    ap = argparse.ArgumentParser(description="基金净值批量下载（日常增量 / 回填两种模式）")
+    ap.add_argument("--pool-file", default="fund_code_list.csv", help="data/raw 下的池文件名")
+    ap.add_argument("--sleep-sec", type=float, default=1.5, help="每只请求后休眠秒数（限流防护）")
+    ap.add_argument("--force-refresh", action="store_true", help="无视缓存全部重拉")
+    ap.add_argument("--backfill", action="store_true",
+                    help="回填模式：只为缺失缓存拉取，已有缓存一律跳过（长任务断点续传）")
+    args = ap.parse_args()
+    batch_download_funds(sleep_sec=args.sleep_sec, force_refresh=args.force_refresh,
+                         pool_file=args.pool_file, backfill=args.backfill)
