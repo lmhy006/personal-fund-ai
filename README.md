@@ -28,6 +28,8 @@ fund_ai/
 │   ├── model_ridge.py              # Phase2B：Ridge实验runner（折内调参纪律 + 特征消融 + 标签模式）
 │   ├── model_gbdt.py               # Phase2B：LightGBM实验runner（原生NaN走分支 + 折内早停纪律：rmse/ic两种准则）
 │   ├── e4_age_check.py             # E4：主策略年龄适用性/跨段可比性/分层增量空间检验（纯评估无模型）
+│   ├── live_score.py               # 上线评分管道：只用过去252交易日、不检查未来端点 → ml/scores/YYYY-MM.csv
+│   ├── holdout_final.py            # 主策略holdout终审（一次性）：末尾12截面验收 + 报告留档
 │   ├── run_dev_download_clean.py    # 开发池拉取+清洗驱动（后台挂机用）
 │   └── run_full_download_clean.py   # 全量拉取+清洗驱动（phase2正式实验前用）
 ├── data/
@@ -82,6 +84,13 @@ python src/model_gbdt.py --early-stop ic --tag v2_icstop         # E3 v2（IC早
 python src/e4_age_check.py                                        # E4 主策略年龄检验（纯评估）
 # 所有 runner 默认：IC/Top 与基线同在 ret_12m 非缺失行上算（对齐评估），
 # 且逐基金预测留存 ml/experiments/preds_{runner}_{tag}_monthly.csv（评估与训练解耦）
+
+# 9. 上线评分（主策略=近一年收益排序；只用过去252交易日，无未来标签、不检查未来端点）
+python src/live_score.py                                   # 评分日默认=净值最新交易日，落盘 ml/scores/YYYY-MM.csv
+python src/live_score.py --as-of 2026-02-27 --verify-panel --no-save   # 与面板同截面逐基金对账（口径自检）
+
+# 10. holdout 终审（**只允许跑一次**；跑完主策略与评估口径冻结）
+python src/holdout_final.py                                # 末尾12截面(2025-03~2026-02)验收，报告留档
 ```
 
 ## 指标口径（重要）
@@ -185,6 +194,42 @@ python src/e4_age_check.py                                        # E4 主策略
 
 **补充诊断与边界：**动量基线在四个开发期历史段的平均 IC 均为正（0.066 / 0.091 / 0.126 / 0.091）；按过去 beta 粗分的三组内，动量 IC 也均为正（0.064 / 0.130 / 0.110）。这些结果表明信号不只是跨粗 beta 组排序，**尚不能证明已消除所有风格影响**。单因子树的大量折只训练一轮，产生较多并列预测；这是当前树配置的诊断结果，不能推广成“树模型不能做自证”。评估行对齐、E4 和主策略选择现均已完成，结果以上述较新的对齐评估及 E4 段落为准。
 
+## 上线评分管道（2026-09-17 建成，问题④最后缺口）
+
+**与研究管道的分工**（`src/live_score.py` vs `src/panel_builder.py`）：
+
+| | 研究（panel_builder） | 上线（live_score） |
+|---|---|---|
+| 信息范围 | 需要未来 126 交易日标签 | **只用过去 252 交易日** |
+| eligibility | 成立≥365天 + 当期披露 + coverage≥95% + **标签期末披露**（未来端点） | 成立≥365天 + 当期披露 + coverage≥95%，**无任何未来检查** |
+| 可评截面 | 止于 2026-02（标签完整性所限） | 到净值最新日 **2026-09-15** |
+
+**口径自检（对账）**：以面板已有截面 2026-02-27 跑上线管道与面板 `ret_12m` 逐基金比对——**1498 只交集，最大绝对差 0.000e+00**，两条管道同值。
+
+**首次正式评分已留存**：`ml/scores/2026-09.csv`（评分日 2026-09-15，可评分 **1461 只**：排除 coverage 不足 2 只、252 交易日窗口不足 37 只）——从本次起积累向前验证记录。
+
+**同时暴露的覆盖缺口（下一步解决）**：该截面 **short(12-36月) 组 = 0 只**——开发池由“今天有近三年业绩”预筛而来，在最新截面自然全为 ≥36 月龄。因此**不足一年/短历史基金的上线覆盖，必须先把 universe 从开发池 1500 只扩展到全量名单 9661 只**（需先跑 `data_loader.py` 全量增量补拉，数小时），再清洗、评分。
+
+## holdout 终审（2026-09-17 一次性开启，主策略就此冻结）
+
+`src/holdout_final.py` 用预留的末尾 12 个截面（2025-03~2026-02，dev 期从未触碰）验收主策略，报告留档 `ml/wf_splits/holdout_verdict.txt`。
+
+| 指标 | holdout（12 月） | dev 对照（228 月） |
+|---|---|---|
+| 主策略 mean IC | **+0.2608** | +0.0934 |
+| IC>0 月份占比 | **12/12** | 0.68 |
+| NW(6) t | **+5.90** | +3.37 |
+| Top20% 绝对收益（6月） | 23.49% | 9.41% |
+| Top20% 相对沪深300 | +14.07% | +2.10% |
+| Top20% 相对全池 | +9.56% | +1.37% |
+| Top−Bottom 价差 | +13.93%（NW +3.62） | — |
+
+**判定**：方向一致、无灾难性失效、显著为正 → 支持进入 Phase 3。
+
+**必须随结论引用的三条限定**：① holdout 段是**单一市场状态**（该段全池 6 月均收益 +13.9%、基准 +9.4% 的强势市），IC 达 dev 期 **2.8 倍**正是**动量收益时变性**（regime 依赖）的表现，**不能假设 0.26 会持续**；② 12 个截面且标签重叠 5/6 → 有效样本约 3~5，本终审用于**排查灾难性失效**，不是确证有效性；③ 现存池条件性研究，组合层未计费用/换手。
+
+**对 Phase 3 的直接要求**：回测必须覆盖多个市场状态（dev 段 2006-2025 含多轮牛熊），不得以 holdout 的高 IC 当作预期收益；主策略与评估口径自本报告起**冻结**，任何后续变更须标注为“holdout 后变更”。
+
 ## 输出物
 
 - `data/analyze/analysis_summary.csv`：每基金一行，含 fund_name、累计收益、年化收益/波动、夏普、最大回撤/修复、VaR95/CVaR95、下行偏差、alpha（含 t/p/R²/样本数）、beta
@@ -198,6 +243,8 @@ python src/e4_age_check.py                                        # E4 主策略
 - `ml/experiments/gbdt_{tag}_monthly.csv`：同上（列 `n_rounds`/`valid_ic` 记录折内早停轮数与验证段月度IC）。提交的完整实验汇总为 `gbdt_v1`、`gbdt_v2_icstop`、`gbdt_v2`、`gbdt_v2align` 和 `gbdt_r12only`；分片与冒烟文件是本地中间产物。
 - `ml/experiments/preds_{ridge,gbdt}_{tag}_monthly.csv`：逐基金预测留存（fund_code/t_date/age_months/ret_12m/sharpe_12m/y/pred，全体行含缺失）——评估与训练解耦，任何口径（对齐/分年龄/分位组）可离线重算，不必重跑模型
 - `ml/experiments/e4_age_check_monthly.csv`：E4 逐月明细（全池/组内 IC、Top 组年龄构成、组内 vs 全池 Top 收益）
+- `ml/scores/YYYY-MM.csv`：上线评分快照（rank/fund_code/fund_name/score/age_months/age_group/coverage/as_of）——评分日=净值最新交易日（可评到 2026-09，研究面板因需未来标签止于 2026-02）；第一次快照 `2026-09.csv`（1461 只）
+- `ml/wf_splits/holdout_verdict.txt` + `holdout_verdict_monthly.csv`：holdout 终审报告与逐月明细（2026-09-17 一次性开启）
 
 ## 数据层约定
 
@@ -215,4 +262,4 @@ python src/e4_age_check.py                                        # E4 主策略
 - **基准错配**：行业/小盘基金对沪深300 的 beta/alpha 失真，靠 `r_squared` 门槛辅助过滤（开发池中 481/1493 只 R²<0.5）
 - **无风险利率固定 2%**：beta≈1.4 时 alpha 误差约 ±0.3pp
 - EDA 跳变检测、探查报告基于**全历史原始数据**，而清洗报告只覆盖统一窗口内基金，两者计数不可直接对比
-- **新基金（<1年）尚不可预测**：分层模型（Short-history 12–36月 / Full ≥36月）为待验证设计，需按 age 分层分别训练并在各自样本外检验分数可比较性后，才能合并排行
+- **新基金（<1年）尚不可预测**：E4 已证明 12–36 月段主策略适用（无需专用模型），但**不足一年基金仍无方案**；上线管道实测当前开发池在 2026-09 截面 short 组 = 0（池子预筛所致），全量覆盖需扩展 universe 至 9661 只（`data_loader.py` 全量补拉 + 清洗 + 评分）
