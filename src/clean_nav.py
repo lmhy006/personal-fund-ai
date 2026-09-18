@@ -274,7 +274,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
                 **stat,
                 "clean_date_span_days": 0
             })
-            print(f"[{fund_code}] ⚠️ 清洗后为空，整只剔除")
+            print(f"[{fund_code}] [WARN] 清洗后为空，整只剔除")
             continue
 
         # 批量层校验1/2（仅current模式）：窗口起止校验；full模式保留完整历史，eligibility下沉到panel层
@@ -288,7 +288,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
                     **stat,
                     "clean_date_span_days": 0
                 })
-                print(f"[{fund_code}] ⚠️ 覆盖不足{WINDOW_YEARS}年窗口（首日{first_date.date()}），整只剔除")
+                print(f"[{fund_code}] [WARN] 覆盖不足{WINDOW_YEARS}年窗口（首日{first_date.date()}），整只剔除")
                 continue
 
             last_date = df_clean["date"].max()
@@ -300,7 +300,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
                     **stat,
                     "clean_date_span_days": 0
                 })
-                print(f"[{fund_code}] ⚠️ 窗口尾部缺数据（最后{last_date.date()}），整只剔除")
+                print(f"[{fund_code}] [WARN] 窗口尾部缺数据（最后{last_date.date()}），整只剔除")
                 continue
 
             # 截断到统一窗口后暂存
@@ -339,7 +339,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
                     **stat,
                     "clean_date_span_days": clean_span
                 })
-                print(f"[{fund_code}] ⚠️ 披露覆盖率 {cov_ratio:.1%} 过低（{len(df_win)}条/{cov_total}日），整只剔除")
+                print(f"[{fund_code}] [WARN] 披露覆盖率 {cov_ratio:.1%} 过低（{len(df_win)}条/{cov_total}日），整只剔除")
                 continue
             filtered.append((fund_code, df_win, stat, clean_span))
         passed = filtered
@@ -363,7 +363,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
         common_start = max(df["date"].min() for _, df, _, _ in passed)
         common_end = min(df["date"].max() for _, df, _, _ in passed)
         if (common_end - common_start).days < 1000:
-            print(f"⚠️ 共同窗口跨度异常：{common_start.date()} ~ {common_end.date()}，请人工检查数据")
+            print(f"[WARN] 共同窗口跨度异常：{common_start.date()} ~ {common_end.date()}，请人工检查数据")
         print(f"严格共同窗口：{common_start.date()} ~ {common_end.date()}（全体基金一致）")
         aligned = []
         for fund_code, df_win, stat, _ in passed:
@@ -386,7 +386,7 @@ def clean_all(pool_file: str = None, window: str = "current"):
             **stat,
             "clean_date_span_days": clean_span
         })
-        print(f"[{fund_code}] ✅ ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
+        print(f"[{fund_code}] [OK] ok |原始:{stat['rows_original']} 清洗后:{stat['rows_after_clean']} 跨度:{clean_span}d 可疑跳变:{stat['suspicious_jump_cnt']}")
 
     # 统一填充基金名称（来自全量元数据），报告与processed同批次携带名称快照
     for rec in report_list:

@@ -105,7 +105,7 @@ def load_benchmark_hs300(use_cache: bool = True) -> pd.DataFrame:
     print("[失败] 沪深300基准多次请求失败")
     return None
 
-def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
+def batch_download_funds(sleep_sec: float = 1.0, force_refresh: bool = False,
                          pool_file: str = "fund_code_list.csv", backfill: bool = False):
     """
     批量下载净值：读取指定基金池（默认 fund_code_list.csv = 全量股票型+混合型）
@@ -117,7 +117,7 @@ def batch_download_funds(sleep_sec: float = 2.0, force_refresh: bool = False,
         为什么必须分开：锚点随日期前进，多天长任务（全量 universe 补拉 9661 只，需数小时至
         十几小时）若按新鲜度判断，前一天的进度会在 3 天后被判"过期"而重拉，长任务无法收敛。
         回填完成后如要让缓存跟上最新净值，再用日常增量模式跑一次即可。
-    :param sleep_sec: 每只请求后休眠秒数，防止IP限流，建议1.5~3；全量拉取建议2.0
+    :param sleep_sec: 每只请求后休眠秒数，防止IP限流，建议1.0~3；全量拉取建议2.0
     :param force_refresh: True则无视缓存全部重拉（数据源异常回补时用）
     :param pool_file: data/raw 下的池文件名，phase0调试可用 "phase0_fund_pool.csv"
     :param backfill: 回填模式：只拉缺失缓存，已有缓存跳过（长任务断点续传）
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="基金净值批量下载（日常增量 / 回填两种模式）")
     ap.add_argument("--pool-file", default="fund_code_list.csv", help="data/raw 下的池文件名")
-    ap.add_argument("--sleep-sec", type=float, default=1.5, help="每只请求后休眠秒数（限流防护）")
+    ap.add_argument("--sleep-sec", type=float, default=1.0, help="每只请求后休眠秒数（限流防护）")
     ap.add_argument("--force-refresh", action="store_true", help="无视缓存全部重拉")
     ap.add_argument("--backfill", action="store_true",
                     help="回填模式：只为缺失缓存拉取，已有缓存一律跳过（长任务断点续传）")

@@ -40,6 +40,12 @@ def main():
     ap = argparse.ArgumentParser(description="每日增量更新（全市场当日净值 → 按日追加）")
     ap.add_argument("--pool", default=DEFAULT_POOL, help="基金名单/池文件路径")
     ap.add_argument("--dry-run", action="store_true", help="只统计不写盘")
+    ap.add_argument("--catch-up", action="store_true",
+                    help="强制补齐全部落后基金（无视自动补齐阈值；漏跑多日后用，建议后台运行）")
+    ap.add_argument("--auto-catchup-max", type=int, default=50,
+                    help="缝隙区基金自动补齐的数量上限（默认 50；超过则只提示不自动跑）")
+    ap.add_argument("--sleep-sec", type=float, default=1.5,
+                    help="catch-up 逐只拉取的限流间隔（秒）")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -48,8 +54,8 @@ def main():
     print(f"当日接口：{len(daily)} 只基金 | 覆盖交易日 {dates} | 请求耗时 {time.time() - t0:.1f}s")
 
     codes = pd.read_csv(args.pool, dtype={"基金代码": str})["基金代码"].astype(str).tolist()
-    stat = {"updated": 0, "uptodate": 0, "stale": 0, "nocache": 0, "nodata": 0}
-    stale_list = []
+    stat = {"updated": 0, "uptodate": 0, "gap": 0, "nocache": 0, "nodata": 0}
+    gap_list = []
     for code in codes:
         path = os.path.join(NAV_DIR, f"fund_{code}.csv")
         if not os.path.exists(path):
@@ -72,8 +78,12 @@ def main():
             stat["uptodate"] += 1
             continue
         if prev is not None and last < pd.Timestamp(prev):
-            stat["stale"] += 1
-            stale_list.append((code, str(last.date())))
+            # 缝隙区：落后 ≥2 个交易日
+            #   data_loader 的容差是 3 天（落后 ≤3 天它不重拉），而 daily 接口只给最近两天、
+            #   缺中间交易日的**官方日增长率**——本脚本不猜（净值比在分红除权日口径不一致），
+            #   因此列入 catch-up 队列（逐只全历史重拉，口径最干净）。
+            stat["gap"] += 1
+            gap_list.append((code, str(last.date()), int((pd.Timestamp(latest) - last).days)))
             continue
         if args.dry_run:
             stat["updated"] += 1
@@ -95,9 +105,36 @@ def main():
     print(f"名单 {len(codes)} 只：追加最新交易日({latest}) {stat['updated']} 只 | "
           f"已最新 {stat['uptodate']} 只")
     print(f"名单内未缓存（需 --backfill 回填）{stat['nocache']} 只 | "
-          f"接口无数据 {stat['nodata']} 只 | 落后≥2日需逐只补齐 {stat['stale']} 只")
-    if stale_list:
-        print("落后样例（代码, 缓存末日期）:", stale_list[:5])
+          f"接口无数据 {stat['nodata']} 只 | "
+          f"缝隙区（落后≥2交易日，data_loader不拉+daily补不了）{stat['gap']} 只")
+    if gap_list:
+        print("缝隙区样例（代码, 缓存末日期, 落后自然日）:", gap_list[:5])
+
+    # 缝隙区补齐：落后 ≥2 个交易日的基金既不在 data_loader 的 3 天容差内被重拉，
+    # 也超出 daily 接口能力 → 默认自动逐只补齐（数量少时无感）；
+    # 数量超阈值则只提示，避免"每日运行"意外变成数小时长任务。
+    todo = gap_list
+    auto = bool(todo) and (args.catch_up or len(todo) <= args.auto_catchup_max)
+    if todo and args.dry_run:
+        print(f"（dry-run：本次不执行 catch-up 补齐；缝隙区 {len(todo)} 只待补）")
+    elif todo and auto:
+        from data_loader import load_single_fund   # 延迟导入，避免无谓依赖
+        print(f"\n>>> catch-up：逐只全历史重拉 {len(todo)} 只缝隙区基金"
+              f"（预计 {len(todo) * (args.sleep_sec + 1) / 60:.1f} 分钟）...")
+        ok = fail = 0
+        for i, (code, _last, _days) in enumerate(todo, 1):
+            df = load_single_fund(code, use_cache=False)   # 强制重拉，忽略缓存
+            ok += df is not None
+            fail += df is None
+            time.sleep(args.sleep_sec)
+            if i % 50 == 0:
+                print(f"  进度 {i}/{len(todo)}（成功 {ok} / 失败 {fail}）")
+        print(f"catch-up 完成：成功 {ok} / 失败 {fail}")
+    elif todo and not auto:
+        print(f"\n⚠️ 缝隙区有 {len(todo)} 只落后基金，超过自动补齐阈值 "
+              f"{args.auto_catchup_max}——本次未自动执行。")
+        print("   请运行：python src/daily_update.py --catch-up"
+              "（或等 data_loader 的 3 天容差过期后自然接管）")
     print(f"总耗时 {time.time() - t0:.1f} 秒")
 
 

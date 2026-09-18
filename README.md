@@ -64,10 +64,12 @@ python src/data_loader.py --backfill          # 回填：只为缺失缓存拉�
 
 # 2b. 日常运行（落地后每天）：**1 次请求**拿全市场当日净值 → 按日追加，约 30 秒
 python src/daily_update.py             # 追加最新交易日到各基金缓存（原子写）
+python src/daily_update.py --catch-up  # 漏跑多日后补齐：落后≥2日的基金逐只全历史重拉
 python src/daily_update.py --dry-run   # 只统计不写盘
 #   为什么不用 data_loader：它是逐只整只全历史重拉（9661只≈8小时），只适合回填；
 #   东财 fund_open_fund_daily_em 一次返回全市场约 2.4 万只的最近两个交易日净值+日增长率。
-#   边界：落后 ≥2 个交易日的基金只报告（接口仅给最近两天），用 data_loader 日常增量补齐。
+#   **不必每天运行**：漏 1~2 个交易日 → daily_update 直接补；漏更多 → --catch-up 逐只补齐
+#   （历史净值随时可从逐只接口拉回，数据不会丢，只是补齐更慢）。
 
 # 3. 探查原始数据（可选，重跑覆盖报告）
 python src/eda_nav.py
@@ -232,7 +234,7 @@ python src/holdout_final.py                                # 末尾12截面(2025
 
 **窗口对比的 holdout 后发现（记录，不改主策略）**：dev 段各窗口 IC = ret_1m +0.050 / ret_3m +0.089 / **ret_6m +0.113** / ret_12m +0.093；差值 ret_6m−ret_12m = +0.0200 但 **NW t=+1.39 不显著** → 不构成更换主策略的依据。主策略已于 holdout 冻结，此项列为“holdout 后变更候选”，需独立向前数据验证。
 
-**全量 universe 扩展（进行中）**：补拉全量 9661 只净值（名单内待补 7985 只，约 5.5 小时，后台 `logs/full_pull_v3.log`）→ 完成后经 `clean_nav(full)` 清洗 → 重跑评分：届时应首次出现 **6–12 月龄低置信度组**与 `<6月` 不评分组（当前开发池在最新截面全为 ≥36 月龄，故两组为空）。
+**全量 universe 扩展（2026-09-18 完成）**：补拉全量 9661 只净值（`--backfill` 断点续传，失败 110 只随后补净）→ `clean_nav(full)` 全量清洗（份额去重后 **5317 只**，异常 0）→ 重跑评分：**5118 只可评分（主策略 4898 + 低置信度 220）**，`ml/scores/2026-09.csv` 已更新为全量版——**6–12 月龄低置信度组首次生效**（220 只），`<6月` 155 只明确不评分。
 
 ## holdout 终审（2026-09-17 一次性开启，主策略就此冻结）
 
@@ -268,7 +270,7 @@ python src/holdout_final.py                                # 末尾12截面(2025
 - `ml/experiments/preds_{ridge,gbdt}_{tag}_monthly.csv`：逐基金预测留存（fund_code/t_date/age_months/ret_12m/sharpe_12m/y/pred，全体行含缺失）——评估与训练解耦，任何口径（对齐/分年龄/分位组）可离线重算，不必重跑模型
 - `ml/experiments/e4_age_check_monthly.csv`：E4 逐月明细（全池/组内 IC、Top 组年龄构成、组内 vs 全池 Top 收益）
 - `ml/experiments/young_fund_check_monthly.csv`：年轻基金样本长表（age_bucket × 可得窗口动量 × 未来6月收益，dev 段），不足一年基金方案的研究依据
-- `ml/scores/YYYY-MM.csv`：上线评分快照（rank/fund_code/fund_name/score/age_months/age_group/coverage/as_of）——评分日=净值最新交易日（可评到 2026-09，研究面板因需未来标签止于 2026-02）；第一次快照 `2026-09.csv`（1461 只）
+- `ml/scores/YYYY-MM.csv`：上线评分快照（rank/rank_lowconf/fund_code/fund_name/score/signal/confidence/age_months/age_group/coverage/as_of）——评分日=净值最新交易日；2026-09-18 起为**全量版**（分层：主策略 4898 + 低置信度 220 = 5118 只）
 - `ml/wf_splits/holdout_verdict.txt` + `holdout_verdict_monthly.csv`：holdout 终审报告与逐月明细（2026-09-17 一次性开启）
 
 ## 数据层约定
@@ -276,7 +278,8 @@ python src/holdout_final.py                                # 末尾12截面(2025
 - `data/raw/` 只增不改；净值缓存在 `data/raw/fund_nav/`，每日运行 `data_loader.py` 时以基准最新交易日为锚点自动增量更新（落后超 3 天重拉）。**两种模式必须区分**（2026-09-17 增补）：日常增量按锚点判新鲜度（容忍净值 T+1 披露滞后）；`--backfill` 只拉缺失缓存、已有缓存一律跳过——多天长任务不能用日常模式，否则锚点前进会让已完成进度反复作废
 - 清洗写盘采用 tmp → backup 让位法原子交换，任何失败场景下磁盘上保留完整批次；两次 rename 之间正式路径短暂不存在，**当前流程假设串行执行**（若未来清洗与分析并行运行，需增加任务锁或版本目录+指针方案）
 - **两条 processed 管线**：`current`（三年严格共同窗口，Phase1 分析视图）与 `full`（全历史，Phase2 面板数据源）并存，分别输出 fund_processed/ 与 fund_history/，勿混用
-- 评分留存约定：每次正式预测的评分快照落盘 `ml/scores/YYYY-MM.csv`，从第一次正式预测开始积累**向前验证记录**（回测不可替代）
+- 评分留存约定：每次正式预测的评分快照落盘 `ml/scores/YYYY-MM.csv`，从第一次正式预测开始积累**向前验证记录**（回测不可替代）。**断档可合法回填**：主策略是无参数规则（动量排序，无拟合），评分只依赖 ≤t 的历史净值 → 事后用全历史重建某历史日评分，数值与当时真跑一致（须标注"事后回填"；缺的是"当时真做了预测"的仪式感，不是信息）
+- **落地运行的频率与设备（2026-09-17 结论）**：数据层面**不必每天运行**——漏 1~2 个交易日用 `daily_update.py` 直接补，漏更多用 `--catch-up` 逐只补齐（漏 5 天约 6 小时，可周末后台跑），历史净值随时可拉、不会丢。因此**不需要租服务器**：家用电脑 + Windows 任务计划程序（勾选"错过计划后尽快启动"）即可；只有要 7×24 无人值守（Phase 4 Agent 自动化）时才需常开设备或轻量云主机
 - 网络依赖：基金净值走东财接口，沪深300 走新浪接口（东财 push2his 指数接口在部分环境被拒）；限流防护默认 sleep 1.5s
 - pandas 3.0 坑：`datetime64` 默认单位为**微秒**，`.astype("int64")` 取出微秒数；涉及时间戳数值运算必须 `to_numpy(dtype="datetime64[ns]").astype("int64")`（panel_builder 踩过）
 
@@ -287,4 +290,4 @@ python src/holdout_final.py                                # 末尾12截面(2025
 - **基准错配**：行业/小盘基金对沪深300 的 beta/alpha 失真，靠 `r_squared` 门槛辅助过滤（开发池中 481/1493 只 R²<0.5）
 - **无风险利率固定 2%**：beta≈1.4 时 alpha 误差约 ±0.3pp
 - EDA 跳变检测、探查报告基于**全历史原始数据**，而清洗报告只覆盖统一窗口内基金，两者计数不可直接对比
-- **不足一年基金已有分层方案（2026-09-17）**：`src/young_fund_check.py` dev 段实定——6–12 月龄用 **ret_6m**（IC +0.120、NW +2.95）给低置信度评分（`confidence=low`，组内单列不与主排行混排）；**<6 月龄唯一可得 ret_1m 不显著（NW +1.30），明确不评分**，不用更短窗口硬凑分数。当前开发池在最新截面全为 ≥36 月龄，该方案要等**全量 universe 补拉 + 清洗**后才能在实际评分中生效（届时首次出现 young 组）
+- **不足一年基金已有分层方案（2026-09-17 定，09-18 随全量 universe 生效）**：`src/young_fund_check.py` dev 段实定——6–12 月龄用 **ret_6m**（IC +0.120、NW +2.95）给低置信度评分（`confidence=low`，组内单列不与主排行混排）；**<6 月龄唯一可得 ret_1m 不显著（NW +1.30），明确不评分**，不用更短窗口硬凑分数。已生效于 `ml/scores/2026-09.csv`：主策略 4898 只 + 低置信度组 220 只。
