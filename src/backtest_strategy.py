@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from panel_builder import (load_fund_series, BENCH_PATH, PROJECT_ROOT, DAY_NS)
-from walk_forward_splitter import LABEL_COL
+from walk_forward_splitter import LABEL_COL, nw_tstat
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(PROJECT_ROOT, "ml", "backtest")
@@ -57,13 +57,14 @@ def load_month_rets(series, bench_dates, month_ts):
     return month_idx, rets_map
 
 
-def build_no_future_screens(series, bench_dates, month_idx, month_ts):
+def build_no_future_screens(series, bench_dates, month_idx, month_ts, type_map=None):
     """每月末的无未来端点台账截面（v2 修正①）。
 
     对每只基金、每月末：成立≥365自然日 + 当期15天内有披露 + 过去252交易日 coverage≥95%
     （缺失=未披露），ret_12m = W[i]/W[i-252]−1（窗口有效观测≥252 才可算）。
     不含任何未来披露端点检查；月集合来自研究面板的日期，仅用于时间轴。
-    返回 screens[m] = list[(fund_code, ret_12m)]，m 与 month_ts 对齐（仅含上月已有数据索引）。
+    type_map 提供后，返回 (code, ret_12m, type_group) 三元组（风格内动量用；
+    类型取"当前"标签作历史近似，标注局限）。返回 screens[m]，m 与 month_ts 对齐。
     """
     prep = {}
     for code, s in series.items():
@@ -89,9 +90,34 @@ def build_no_future_screens(series, bench_dates, month_idx, month_ts):
             if n_eff / (LOOKBACK + 1) < MIN_COV:
                 continue                                       # 披露完整度不足
             r12 = float(w[i] / w[w0] - 1.0)
-            rows.append((code, r12))
+            rows.append((code, r12) if type_map is None
+                        else (code, r12, type_map.get(code, "其他")))
         screens[m] = rows
     return screens
+
+
+def type_group(t: str) -> str:
+    """基金类型 → 风格组（第一版粗分组；类型取当前标签，历史作近似）。"""
+    if t == "股票型":
+        return "股票"
+    if t in ("混合型-偏股", "混合型-灵活"):
+        return "混合进攻"
+    if t in ("混合型-偏债", "混合型-平衡", "混合型-绝对收益"):
+        return "混合防守"
+    return "其他"
+
+
+def select_by_group(screen, top_n: int) -> list:
+    """组内按 ret_12m 选股、按组内占比分配名额，合并到约 top_n 只（风格内动量）。"""
+    buckets = {}
+    for item in screen:
+        code, _r12, grp = item
+        buckets.setdefault(grp, []).append((code, _r12))
+    picks, total = [], len(screen)
+    for grp, items in buckets.items():
+        k = max(1, round(top_n * len(items) / max(total, 1)))
+        picks += [c for c, _ in sorted(items, key=lambda x: x[1], reverse=True)[:k]]
+    return picks[:top_n]
 
 
 def regime_no_lookahead(bench_close, month_idx, lookback=LOOKBACK) -> list:
@@ -108,8 +134,9 @@ def regime_no_lookahead(bench_close, month_idx, lookback=LOOKBACK) -> list:
     return out
 
 
-def run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m, regime_m,
-                 top_n: int, buy_fee: float, sell_fee: float, start_idx: int = 0) -> pd.DataFrame:
+def run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m, pool_ret_net_m,
+                 regime_m, top_n: int, buy_fee: float, sell_fee: float,
+                 start_idx: int = 0, stratify: bool = False) -> pd.DataFrame:
     """逐月回测主循环（收益先算、调仓在后——只用 ≤t 信息）。"""
     rows = []
     active = []            # 在持队列：[[建仓月索引 m, codes], ...]
@@ -125,8 +152,10 @@ def run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m, regime_m,
         # ② 调仓（为下月）：到期移出 + 用本月台账截面选新仓
         expired = [a for a in active if m - a[0] >= HOLD]
         active = [a for a in active if m - a[0] < HOLD]
-        top = sorted(screens[m], key=lambda x: x[1], reverse=True)[:top_n]
-        active.append([m, [c for c, _ in top]])
+        picks = (select_by_group(screens[m], top_n) if stratify
+                 else [c for c, _ in sorted(screens[m], key=lambda x: x[1],
+                                            reverse=True)[:top_n]])
+        active.append([m, picks])
         # ③ 费用（实际发生月）
         w = 1.0 / HOLD
         fee = w * sell_fee * (len(expired) > 0) + w * buy_fee
@@ -138,9 +167,43 @@ def run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m, regime_m,
             "r_gross": r_gross, "r_net": r_net,
             "nav_gross": nav_g, "nav_net": nav_n,
             "bench_ret": bench_ret_m[m - 1], "pool_ret": pool_ret_m[m - 1],
+            "pool_ret_net": pool_ret_net_m[m - 1],
             "n_held": n_held, "turnover_2sided": 2.0 * w,
         })
     return pd.DataFrame(rows)
+
+
+def pool_rebalance_cost(screens, rets_map, pool_ret_m) -> np.ndarray:
+    """全池等权"每月再平衡"的交易成本（与策略同一费率口径）。
+
+    单边换手 = Σ|Δw|/2：在池基金权重漂移（上月权重×收益 → 调回等权）+ 出入池全额。
+    成本 = 单边换手 × (申购 + 赎回)。返回每月的费率（与 pool_ret_m 对齐）。"""
+    costs = []
+    for m in range(1, len(screens)):
+        n_prev, n_cur = len(screens[m - 1]), len(screens[m])
+        if n_prev == 0 or n_cur == 0:
+            costs.append(0.0)
+            continue
+        prev_set = {x[0] for x in screens[m - 1]}
+        cur_set = {x[0] for x in screens[m]}
+        R_prev = float(pool_ret_m[m - 1]) if np.isfinite(pool_ret_m[m - 1]) else 0.0
+        flow = 0.0
+        for c in prev_set:
+            w0 = 1.0 / n_prev
+            if c in cur_set:
+                if c in rets_map:
+                    r = rets_map[c][m - 1]
+                    w1 = w0 * (1.0 + r) / (1.0 + R_prev) if np.isfinite(r) else w0
+                else:
+                    w1 = w0
+                flow += abs(w1 - 1.0 / n_cur)          # 在池漂移调回等权
+            else:
+                flow += w0                              # 出池全额卖出
+        for c in (cur_set - prev_set):
+            flow += 1.0 / n_cur                         # 入池全额买入
+        t1 = flow / 2.0                                # 单边换手
+        costs.append(t1 * (SELL_FEE + BUY_FEE))
+    return np.array(costs)
 
 
 def summarize(df: pd.DataFrame, label: str) -> dict:
@@ -158,13 +221,15 @@ def summarize(df: pd.DataFrame, label: str) -> dict:
     b_ann = b_nav[-1] ** (12.0 / n) - 1.0
     p_nav = np.cumprod(1.0 + df["pool_ret"].values)
     p_ann = p_nav[-1] ** (12.0 / n) - 1.0
+    pn_nav = np.cumprod(1.0 + df["pool_ret_net"].values)
+    p_ann_net = pn_nav[-1] ** (12.0 / n) - 1.0
     return {
         "label": label, "n_months": n,
         "ann_ret": ann_ret, "ann_ret_gross": ann_gross,
         "fee_drag_pp": (ann_gross - ann_ret) * 100.0,
         "vol": vol, "sharpe": sharpe, "mdd": mdd,
         "calmar": ann_ret / abs(mdd) if mdd != 0 else np.nan,
-        "bench_ann": b_ann, "pool_ann": p_ann,
+        "bench_ann": b_ann, "pool_ann": p_ann, "pool_ann_net": p_ann_net,
         "monthly_turnover_2sided": float(df["turnover_2sided"].mean()),
     }
 
@@ -176,6 +241,9 @@ def main():
     ap.add_argument("--sensitivity", action="store_true")
     ap.add_argument("--min-funds", type=int, default=50,
                     help="回测起点：台账截面基金数至少该值")
+    ap.add_argument("--stratify-type", action="store_true",
+                    help="类型分层选股（风格内动量第一版：组内按动量选股合并，"
+                         "类型取 data/raw/fund_meta_type.csv 的当前标签作历史近似）")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
@@ -193,7 +261,13 @@ def main():
     print("加载净值并构建台账截面（约 1-3 分钟）…")
     series = load_fund_series(bench_dates)
     month_idx, rets_map = load_month_rets(series, bench_dates, month_ts)
-    screens = build_no_future_screens(series, bench_dates, month_idx, month_ts)
+    type_map = None
+    if args.stratify_type:
+        tm = pd.read_csv(os.path.join(PROJECT_ROOT, "data", "raw", "fund_meta_type.csv"),
+                         dtype=str)
+        type_map = {r["基金代码"]: type_group(str(r["基金类型"])) for _, r in tm.iterrows()}
+        print(f"类型分层：{len(type_map)} 只基金映射到类型组")
+    screens = build_no_future_screens(series, bench_dates, month_idx, month_ts, type_map)
     print(f"截面 {len(month_ts)} 个月末；台账基金 {len(series)} 只；"
           f"首月可评 {len(screens[0])} 只 / 末月 {len(screens[len(month_ts) - 1])} 只")
 
@@ -202,10 +276,12 @@ def main():
     # 全池等权基准：与组合**同入选时点**——上月（m-1）台账在座基金在 [m-1, m] 的收益（v2 修正②）
     pool_ret_m = []
     for m in range(1, len(month_ts)):
-        codes = [c for c, _ in screens[m - 1]]
+        codes = [x[0] for x in screens[m - 1]]
         vals = [rets_map[c][m - 1] for c in codes if c in rets_map]
         pool_ret_m.append(float(np.mean(vals)) if vals else 0.0)
     pool_ret_m = np.array(pool_ret_m)
+    pool_cost_m = pool_rebalance_cost(screens, rets_map, pool_ret_m)
+    pool_ret_net_m = (1.0 + pool_ret_m) * (1.0 - pool_cost_m) - 1.0
     regime_m = regime_no_lookahead(bc, month_idx)
 
     start_idx = 0
@@ -215,8 +291,9 @@ def main():
             break
     print(f"回测起点：{month_ts[start_idx].date()}（台账截面基金数 ≥ {args.min_funds}）")
 
-    df = run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m,
-                      regime_m, args.top_n, BUY_FEE, SELL_FEE, start_idx)
+    df = run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m, pool_ret_net_m,
+                      regime_m, args.top_n, BUY_FEE, SELL_FEE, start_idx,
+                      stratify=args.stratify_type)
     os.makedirs(OUT_DIR, exist_ok=True)
     if not args.no_save:
         df.to_csv(os.path.join(OUT_DIR, f"portfolio_nav_{args.phase}_top{args.top_n}.csv"),
@@ -227,12 +304,15 @@ def main():
     lines = ["=" * 72,
              f"Phase 3 主策略组合回测报告 v2（{args.phase} 段，费用后主口径）",
              f"组合：Top{args.top_n} 等权；{HOLD_SEMANTICS}；费用 申购{BUY_FEE:.2%}+赎回{SELL_FEE:.2%}",
-             "口径：无未来端点台账截面选股 | 全池基准同入选时点 | 状态标签无前瞻",
+             "口径：无未来端点台账截面选股 | 全池基准同入选时点 | 状态标签无前瞻"
+             + (" | **类型分层选股**（风格内动量第一版，类型取当前标签作历史近似）"
+                if args.stratify_type else ""),
              "=" * 72,
              f"区间       : {df.t_date.min().date()} ~ {df.t_date.max().date()}（{s['n_months']} 个月）",
              f"年化收益   : 费用后 {s['ann_ret']:.2%}（费用前 {s['ann_ret_gross']:.2%} → "
              f"侵蚀 {s['fee_drag_pp']:.2f} pp/年）",
-             f"对比基准   : 沪深300 {s['bench_ann']:.2%} / 全池等权 {s['pool_ann']:.2%}",
+             f"对比基准   : 沪深300 {s['bench_ann']:.2%} / 全池等权(零成本参照) {s['pool_ann']:.2%}"
+             f" / 全池等权(可执行) {s['pool_ann_net']:.2%}",
              f"年化波动   : {s['vol']:.2%} | 夏普 {s['sharpe']:.2f} | MDD {s['mdd']:.2%} | Calmar {s['calmar']:.2f}",
              f"月双边换手 : {s['monthly_turnover_2sided']:.2%}（年化单边≈{s['monthly_turnover_2sided']*6:.0%}）"]
     lines.append("")
@@ -242,6 +322,11 @@ def main():
         if len(sub):
             lines.append(f"  {reg:<5s}: {len(sub):>4d} 个月 | 月均 {sub.r_net.mean():+.4%} | "
                          f"年化≈{(1+sub.r_net).prod() ** (12/len(sub)) - 1:+.2%}")
+    diff_pool = (df["r_net"] - df["pool_ret_net"]).dropna()
+    lines.append("")
+    lines.append(f"组合 vs 可执行全池（同费率口径）：月超额 {diff_pool.mean():+.4%}"
+                 f"（naive t={diff_pool.mean()/(diff_pool.std()/len(diff_pool)**0.5):+.2f} | "
+                 f"NW t={nw_tstat(diff_pool):+.2f}）")
     report = "\n".join(lines)
     print(report)
 
@@ -250,7 +335,8 @@ def main():
         sn = []
         for n in SENSITIVITY_N:
             d = run_strategy(screens, month_ts, rets_map, bench_ret_m, pool_ret_m,
-                             regime_m, n, BUY_FEE, SELL_FEE, start_idx)
+                             pool_ret_net_m, regime_m, n, BUY_FEE, SELL_FEE, start_idx,
+                             stratify=args.stratify_type)
             ss = summarize(d, f"Top{n}")
             sn.append(ss)
             if not args.no_save:
