@@ -35,31 +35,37 @@ def age_days_to_months(age_days_ns: int) -> float:
     return age_days_ns / MONTH_NS
 
 
-def load_fund_series(bench_dates: np.ndarray):
+def load_fund_series(bench_dates: np.ndarray, extra_dirs=None):
     """
     读全历史清洗目录下全部基金csv，对齐到基准交易日日历
     对齐规则：基金净值映射到同日基准日索引；未披露日 r=NaN；财富指数 W=∏(1+r) 前向保持
+    :param extra_dirs: 额外清洗目录（如 data/processed/fund_history_delisted/）——
+        用于把**已清盘/终止基金**并回研究池（幸存者偏差修复，见 delisted_funds.py）；
+        同名代码以主目录 HISTORY_DIR 优先
     :return: dict[fund_code] = {dates:int64, r_aligned:array(含NaN), wealth_aligned:array, first_ns:int64}
     """
     series = {}
-    for fname in os.listdir(HISTORY_DIR):
-        if not (fname.startswith("fund_") and fname.endswith(".csv")):
-            continue
-        code = fname.replace("fund_", "").replace(".csv", "")
-        df = pd.read_csv(os.path.join(HISTORY_DIR, fname), parse_dates=["date"])
-        r = df["daily_ret"].astype(float).values
-        # 显式统一为纳秒时间戳（pandas 3.0 的 datetime64 默认单位是 us，直接 astype("int64") 会取成微秒）
-        fdates = df["date"].to_numpy(dtype="datetime64[ns]").astype("int64")
-        r = df["daily_ret"].astype(float).values
-        # 对齐到基准日历：基金披露日 -> 基准日历位置（仅同日匹配，非交易日披露丢弃）
-        pos = np.searchsorted(bench_dates, fdates)
-        ok = (pos < len(bench_dates)) & (bench_dates[np.minimum(pos, len(bench_dates) - 1)] == fdates)
-        r_al = np.full(len(bench_dates), np.nan)
-        r_al[pos[ok]] = r[ok]
-        # 财富指数：NaN日财富保持不变（相当于日收益0），有效日复利
-        growth = np.where(np.isnan(r_al), 0.0, r_al)
-        wealth_al = np.cumprod(1.0 + growth)
-        series[code] = {"dates": fdates, "r_al": r_al, "wealth_al": wealth_al}
+    dirs = [HISTORY_DIR] + [d for d in (extra_dirs or []) if d and os.path.isdir(d)]
+    for d in dirs:
+        for fname in os.listdir(d):
+            if not (fname.startswith("fund_") and fname.endswith(".csv")):
+                continue
+            code = fname.replace("fund_", "").replace(".csv", "")
+            if code in series:          # 主目录优先
+                continue
+            df = pd.read_csv(os.path.join(d, fname), parse_dates=["date"])
+            # 显式统一为纳秒时间戳（pandas 3.0 的 datetime64 默认单位是 us，直接 astype("int64") 会取成微秒）
+            fdates = df["date"].to_numpy(dtype="datetime64[ns]").astype("int64")
+            r = df["daily_ret"].astype(float).values
+            # 对齐到基准日历：基金披露日 -> 基准日历位置（仅同日匹配，非交易日披露丢弃）
+            pos = np.searchsorted(bench_dates, fdates)
+            ok = (pos < len(bench_dates)) & (bench_dates[np.minimum(pos, len(bench_dates) - 1)] == fdates)
+            r_al = np.full(len(bench_dates), np.nan)
+            r_al[pos[ok]] = r[ok]
+            # 财富指数：NaN日财富保持不变（相当于日收益0），有效日复利
+            growth = np.where(np.isnan(r_al), 0.0, r_al)
+            wealth_al = np.cumprod(1.0 + growth)
+            series[code] = {"dates": fdates, "r_al": r_al, "wealth_al": wealth_al}
     return series
 
 

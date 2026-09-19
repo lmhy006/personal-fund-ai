@@ -28,6 +28,10 @@ from walk_forward_splitter import LABEL_COL, nw_tstat
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(PROJECT_ROOT, "ml", "backtest")
 PANEL_PATH = os.path.join(PROJECT_ROOT, "ml", "panel.parquet")
+# 已清盘/终止基金清洗目录（由 delisted_funds.py --clean-history 生成）；
+# --include-delisted 时并入研究池（幸存者偏差修复；名单覆盖年份有限，见 README 已知局限）
+DELISTED_HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "processed",
+                                    "fund_history_delisted")
 
 TOP_N_DEFAULT = 50
 SENSITIVITY_N = [20, 50, 100]
@@ -245,6 +249,9 @@ def main():
                     help="类型分层选股（风格内动量第一版：组内按动量选股合并，"
                          "类型取 data/raw/fund_meta_type.csv 的当前标签作历史近似）")
     ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--include-delisted", action="store_true",
+                    help="把 data/processed/fund_history_delisted/（已清盘基金）并入研究池"
+                         "（幸存者偏差修复；名单覆盖年份有限，见 README 已知局限）")
     args = ap.parse_args()
 
     panel_all = pd.read_parquet(PANEL_PATH)
@@ -259,7 +266,11 @@ def main():
     bench = pd.read_csv(BENCH_PATH, parse_dates=["date"]).sort_values("date")
     bench_dates = bench["date"].to_numpy(dtype="datetime64[ns]").astype("int64")
     print("加载净值并构建台账截面（约 1-3 分钟）…")
-    series = load_fund_series(bench_dates)
+    extra_dirs = [DELISTED_HISTORY_DIR] if args.include_delisted else None
+    if args.include_delisted:
+        print(f"含已清盘基金池：{DELISTED_HISTORY_DIR}")
+    series = load_fund_series(bench_dates, extra_dirs=extra_dirs)
+    print(f"研究池基金 {len(series)} 只")
     month_idx, rets_map = load_month_rets(series, bench_dates, month_ts)
     type_map = None
     if args.stratify_type:
@@ -353,7 +364,11 @@ def main():
     if args.phase == "holdout":
         print("\n⚠️ holdout 段（2025-03~2026-02）已被用于 holdout 终审与本轮回测——"
               "**已看过**。本结果仅作描述性对照，不得作为任何新设计的'最终盲测'。")
-    print("\n（现存池条件性回测：未含已清盘基金；v2 已去除面板未来披露存活条件）")
+    if args.include_delisted:
+        print("\n（**已并入清盘基金池**：EID 公告检索，2014 年后部分覆盖 —— 部分修复，"
+              "不等于幸存者偏差已消除；v2 已去除面板未来披露存活条件）")
+    else:
+        print("\n（现存池条件性回测：未含已清盘基金；v2 已去除面板未来披露存活条件）")
 
 
 if __name__ == "__main__":

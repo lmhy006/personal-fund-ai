@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-09-19 18:17",
+  "source": "证监会基金电子披露平台 EID（eid.csrc.gov.cn）——公募基金法定披露渠道",
+  "endpoint": "http://eid.csrc.gov.cn/fund/disclose/advanced_search_report.do",
+  "method": "GET，参数 aoData=<DataTables aoData JSON>（含业务字段 fundType/reportType/reportYear/fundCompanyShortName/fundCode/fundShortName/startUploadDate/endUploadDate）",
+  "dictionary_endpoint": "http://eid.csrc.gov.cn/fund/disclose/upload_inforeport_query.do（返回 reportTypeList，127 类公告字典）",
+  "referer": "http://eid.csrc.gov.cn/fund/disclose/advanced_search.html",
+  "report_types": {
+    "FC030010": "基金合同终止公告",
+    "FC030030": "基金清算公告",
+    "FB060010": "清算报告",
+    "FC050050": "基金合并运作公告"
+  },
+  "server_constraint": "跨度 >1 个月时必须提供 6 位基金代码（'仅支持根据6位基金代码查询1个月以上数据！'）→ 必须按月窗口扫描",
+  "scan": {
+    "start_year": 2005,
+    "end_year": 2026,
+    "windows": 1056,
+    "windows_per_type_per_year": 12,
+    "elapsed_sec": 990,
+    "sleep_sec_per_request": 0.8
+  },
+  "nav_fetch": {
+    "interface": "akshare fund_open_fund_info_em(indicator='单位净值走势')（含官方日增长率）",
+    "threading": "必须单线程：akshare 内部 py_mini_racer(V8) 同进程多线程会崩（partition_address_space.cc Check failed: !IsConfigurablePoolInitialized）",
+    "nav_acc": "用单位净值占位（清洗与收益只用日增长率，nav_acc 仅参与非0/非NaN校验）",
+    "ok": 1758,
+    "failed": 42,
+    "cleaned_into_history": 1756,
+    "elapsed_min_approx": 21
+  },
+  "results": {
+    "announcements": 3245,
+    "unique_funds": 1800,
+    "offsite": 1565,
+    "onsite": 235,
+    "overlap_with_alive_pool": 2
+  },
+  "channel_notes": [
+    "AKShare 全部公募列表接口只返回存续基金，无退市标的",
+    "巨潮 cninfo column=fund 只覆盖场内（公告代码前缀实测 15/16/18），场外清盘基金不在其公告库 → 不可用",
+    "AMAC 无产品级终止名录（信息公示路径实测 404）",
+    "东财详情页 https://fund.eastmoney.com/{code}.html 可零成本补'终止日期'（实测 505888 → 2019-08-13），本次未使用",
+    "Tushare fund_basic(status='D')（2000 积分）为可选兜底，本次未使用"
+  ]
+}

@@ -1,0 +1,14 @@
+# fund_ai 关键数据哈希（sha256） 生成于 2026-09-19 18:17
+# 用途：这些文件体积小但不易复原（名单/元数据/中间产物），哈希用于跨批次校验
+
+d8fc408b139c0e59db714f208ee7839d1716fa712695c8dd9c04e4755ab68d8f       215,464  data/raw/delisted_funds.csv
+254e74b7ef020bbd7249d1da67ea8110cb27d82307eb10ef1e1a8884734d661d       653,371  data/raw/delisted_announcements.csv
+227d35c99fd6f82bb8fcb672f289a54b8856bd559739e5c6f8d0f14c1ada21dd           350  data/raw/delisted_nav_failures.csv
+ea4a46389e5cf62211895cbb7538fa9d44147377f1d5a0d0b1ef1d204208e885         2,419  data/raw/delisted_query_params.json
+d4244d8777f2c8dd26f5cefeb0234cd5391d76cbd34bb40e6abf103b6376e1d4     2,862,658  data/raw/fund_meta_type.csv
+22aeaaa5a4b7f31410eb5e218e0755d4d84408afcf52ab407233b1bdabd7425f       366,317  data/raw/fund_code_list.csv
+ea76986e4912cd443dbbfd16e38671e9d98be6b629f5be043368f92d4d4b0ae3       125,023  data/raw/benchmark_hs300.csv
+976e1a26d1ba260fc6ea121e16f70a801d85bc2a5f646ef5029ea0ad01352009    12,532,068  ml/panel.parquet
+d8b87349ad13fbf7fb1321f794bb484b0dfea589a20cec3f90b1b9c515f29876       533,297  ml/scores/2026-09.csv
+bf31cda77b63b0e4e6d20dfb3292ca192464acbfb60810a596b02e0465acbe27         8,858  ml/backtest/style_check_dev.txt
+c4237ffefb4d5ec5676eac1c7525641d4220fd5c588ad1a1dd8c83a8e073050c         9,156  ml/backtest/style_check_dev_del.txt

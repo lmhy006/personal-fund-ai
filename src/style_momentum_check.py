@@ -24,11 +24,11 @@ import os
 import numpy as np
 import pandas as pd
 
-from backtest_strategy import (BUY_FEE, DEV_END, HOLD, LOOKBACK, MIN_COV, OUT_DIR,
-                               SELL_FEE, TOP_N_DEFAULT, build_no_future_screens,
-                               load_month_rets, pool_rebalance_cost,
-                               regime_no_lookahead, run_strategy, select_by_group,
-                               summarize)
+from backtest_strategy import (BUY_FEE, DELISTED_HISTORY_DIR, DEV_END, HOLD, LOOKBACK,
+                               MIN_COV, OUT_DIR, SELL_FEE, TOP_N_DEFAULT,
+                               build_no_future_screens, load_month_rets,
+                               pool_rebalance_cost, regime_no_lookahead, run_strategy,
+                               select_by_group, summarize)
 from panel_builder import BENCH_PATH, PROJECT_ROOT, load_fund_series
 from style_factors import (SECTOR_FIRST_VALID, SECTOR_KEYS, SW_SECTORS,
                            load_sector_factors, load_style_factors)
@@ -176,6 +176,30 @@ def segment_annualized(df, n_seg=N_SEGMENTS):
         sub = df.iloc[part]
         yrs = len(sub) / 12.0
         out.append(float((1.0 + sub.r_net).prod() ** (1.0 / yrs) - 1.0) if yrs > 0 else np.nan)
+    return out
+
+
+def paired_vs_orig(results, base="orig"):
+    """各方案相对**原动量**的配对差检验（逐月费用后收益之差 → NW(6)）。
+
+    为什么必须单独做：`excess_*` 检验的是「方案 vs **全池**」；用户要判的是
+    「行业中性/风格中性是否**优于原动量**」——这是另一条配对差序列，t 值不可互推。
+    """
+    out = {}
+    base_df = results[base][0].set_index("t_date")["r_net"]
+    for kind, (df, _s) in results.items():
+        if kind in ("orig", "orig_all"):
+            continue
+        d = (df.set_index("t_date")["r_net"] - base_df).dropna()
+        n = len(d)
+        out[kind] = {
+            "mean": float(d.mean()),
+            "naive_t": float(d.mean() / (d.std(ddof=1) / np.sqrt(n))) if n > 2 else float("nan"),
+            "nw_t": float(nw_tstat(d)),
+            "win_rate": float((d > 0).mean()) if n else float("nan"),
+            "cum_diff": float((1.0 + d).prod() - 1.0) if n else float("nan"),
+            "n_months": n,
+        }
     return out
 
 
@@ -337,6 +361,9 @@ def main():
     ap.add_argument("--smoke", type=int, default=0, help="只跑前 N 个月末（验证用，不落盘报告）")
     ap.add_argument("--recompute-exposure", action="store_true",
                     help="忽略暴露缓存，强制重算滚动回归（默认优先读 ml/backtest/style_exposure_*.parquet）")
+    ap.add_argument("--include-delisted", action="store_true",
+                    help="把已清盘基金（data/processed/fund_history_delisted/）并入研究池"
+                         "（幸存者偏差修复；暴露缓存 key 会加 _del 后缀，与现存池结果分开保存）")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
@@ -351,7 +378,11 @@ def main():
     bench_dates = bench["date"].to_numpy(dtype="datetime64[ns]").astype("int64")
     bc = bench["close"].to_numpy(dtype=float)
     print("加载净值序列…")
-    series = load_fund_series(bench_dates)
+    extra_dirs = [DELISTED_HISTORY_DIR] if args.include_delisted else None
+    if args.include_delisted:
+        print(f"含已清盘基金池：{DELISTED_HISTORY_DIR}")
+    series = load_fund_series(bench_dates, extra_dirs=extra_dirs)
+    print(f"研究池基金 {len(series)} 只")
     month_idx, rets_map = load_month_rets(series, bench_dates, month_ts)
 
     sf = load_style_factors(bench_dates)
@@ -379,9 +410,10 @@ def main():
 
     specs = factor_set_specs()
     os.makedirs(OUT_DIR, exist_ok=True)
+    suffix = "_del" if args.include_delisted else ""      # 含清盘池的结果与现存池分开存
     exps_by_key = {}
     for spec in specs:
-        path = exposure_cache_path(spec["key"])
+        path = exposure_cache_path(spec["key"] + suffix)
         if (not args.recompute_exposure) and (not args.smoke) and os.path.exists(path):
             exps_by_key[spec["key"]] = load_cached_exposures(path)
             print(f"读取暴露缓存：{os.path.basename(path)}"
@@ -430,7 +462,22 @@ def main():
         diag = diagnose_momentum_vs_style(base_screens, exps, names, args.top_n, start=start)
         extra_kinds = [k for k in variants if k not in ("orig", "orig_all")]
         shift = order_shift_diagnostics(variants, month_ts, start, args.top_n, extra_kinds)
-        blocks.append((spec, start, results, diag, shift))
+        paired = paired_vs_orig(results)
+        blocks.append((spec, start, results, diag, shift, paired))
+
+    if not args.no_save and not args.smoke:
+        for spec, _start, results, _diag, _shift, _paired in blocks:
+            rows = []
+            for kind, (df, _s) in results.items():
+                d = df[["t_date", "regime", "r_gross", "r_net", "pool_ret", "pool_ret_net",
+                        "nav_gross", "nav_net"]].copy()
+                d.insert(0, "variant", kind)
+                d.insert(0, "factor_set", spec["key"])
+                rows.append(d)
+            out_df = pd.concat(rows, ignore_index=True)
+            path = os.path.join(OUT_DIR, f"style_variants_{spec['key']}{suffix}_monthly.csv")
+            out_df.to_csv(path, index=False)
+            print(f"逐月收益已落盘：{os.path.basename(path)}（{len(out_df)} 行）")
 
     # ---------------- 报告
     lines = []
@@ -440,8 +487,10 @@ def main():
         f"{k} = {v[1]} − 沪深300（{v[2]} 起）" for k, v in meta.items()) + "；mkt = 沪深300")
     lines.append(f"行业板块因子（成分行业等权日收益 − 沪深300，首个有效日 {SECTOR_FIRST_VALID}）："
                  + "、".join(f"{k}({len(SW_SECTORS[k])})" for k in SECTOR_KEYS))
+    lines.append("两类检验必须分开读：①『月超额(全池)/NW t』= 方案 vs **可执行全池**；"
+                 "②『配对检验』= 方案 vs **原动量**（逐月费用后收益差）。两条序列不同。")
     lines.append("")
-    for spec, start, results, diag, shift in blocks:
+    for spec, start, results, diag, shift, paired in blocks:
         groups = spec["groups"]
         order = [k for k in ("orig_all", "orig", "neutral", "neutral_sector", "group")
                  if k in results]
@@ -454,7 +503,7 @@ def main():
                      f"orig_all 为全台账池）")
         lines.append("-" * 78)
         lines.append(f"{'方案':<12}{'年化(费后)':>11}{'波动':>9}{'夏普':>7}{'MDD':>9}"
-                     f"{'月超额':>10}{'NW t':>8}")
+                     f"{'月超额(全池)':>13}{'NW t':>8}")
         for kind in order:
             _, s = results[kind]
             lines.append(f"{variant_label(kind, groups):<12}{s['ann_ret']:>11.2%}"
@@ -478,6 +527,18 @@ def main():
             lines.append(f"  {variant_label(kind, groups):<11}"
                          + " | ".join(f"{x:+.2%}" for x in results[kind][1]["segments"]))
         lines.append("")
+        lines.append("配对检验——各方案 vs **原动量**（同一在池集合、逐月费用后收益差，NW(6)）：")
+        lines.append(f"  {'方案':<12}{'月均差':>10}{'naive t':>9}{'NW t':>8}{'胜率':>8}{'累计差':>10}")
+        for kind in order:
+            if kind in ("orig", "orig_all") or kind not in paired:
+                continue
+            p = paired[kind]
+            lines.append(f"  {variant_label(kind, groups):<12}{p['mean']:>10.4%}"
+                         f"{p['naive_t']:>9.2f}{p['nw_t']:>8.2f}{p['win_rate']:>8.1%}"
+                         f"{p['cum_diff']:>10.2%}")
+        lines.append("     （对照：上表『月超额 / NW t』的基准是**可执行全池**；本节基准是**原动量**——"
+                     "两条配对序列不同，t 值不可互推）")
+        lines.append("")
         lines.append("诊断——动量与暴露的关系（当月截面）：")
         for label, col in (("① Spearman(ret_12m, beta)", "spearman_"),
                            (f"② Top{args.top_n} 组 beta 偏离全池", "top_minus_pool_")):
@@ -499,17 +560,25 @@ def main():
             lines.append("     " + _shift_txt(k))
         lines.append("")
     report = fmt_report("Phase 3 第二组：滚动风格暴露 + 行业维度（dev 段对照）", lines)
-    report += ("\n\n边界：① dev 段内对照，holdout（2025-03~）已看过，不得作为新设计的盲测；"
-               "② 现存池条件性研究，未含已清盘基金；③ 风格/行业指数均为价格指数；"
+    if args.include_delisted:
+        pool_note = ("② **已清盘基金池已并入**（`data/processed/fund_history_delisted/`，"
+                     "EID 公告检索 → 拉净值 → 清洗；**只覆盖 2014 年后且公告库能查到的事件**，"
+                     "2005-2013 清盘基金仍缺失——属**部分修复**，不等于幸存者偏差已消除；"
+                     "持仓期内终止的基金按财富保持（该段收益记 0）计）")
+    else:
+        pool_note = "② 现存池条件性研究，未含已清盘基金（可加 `--include-delisted` 并入）"
+    report += (f"\n\n边界：① dev 段内对照，holdout（2025-03~）已看过，不得作为新设计的盲测；"
+               f"{pool_note}；③ 风格/行业指数均为价格指数；"
                "④ growth 因子自 2010-06、板块因子自 2014-02 才可得 → 各因子集区间不同，"
                "**只能在同一因子集内横向比较方案，不跨因子集比绝对数**；"
                "⑤ 板块划分为人为选择，2014 年前无法做行业中性化。\n")
     print("\n" + report)
 
     if not args.no_save and not args.smoke:
-        with open(os.path.join(OUT_DIR, "style_check_dev.txt"), "w", encoding="utf-8") as f:
+        out_name = f"style_check_dev{suffix}.txt"
+        with open(os.path.join(OUT_DIR, out_name), "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"\n报告已落盘：{os.path.join(OUT_DIR, 'style_check_dev.txt')}")
+        print(f"\n报告已落盘：{os.path.join(OUT_DIR, out_name)}")
 
 
 if __name__ == "__main__":

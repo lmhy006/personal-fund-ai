@@ -50,3 +50,9 @@ ml/experiments/*smoke*_monthly.csv
 ml/experiments/gbdt_v2[abcd]_monthly.csv
 ml/experiments/gbdt_v2align_[abcd]_monthly.csv
 ml/experiments/preds_gbdt_v2align_[abcd]_monthly.csv
+
+# ===================== Phase 3 中间产物（可再生成，勿提交） =====================
+# 滚动风格/行业暴露缓存（每套 10~28MB，共约 100MB；跑 style_momentum_check.py 可重建）
+ml/backtest/*.parquet
+# 注：data/ 已整体忽略 → 净值缓存（data/raw/fund_nav/）与清洗视图不再跟踪；
+#     但清盘基金代码台账、失败清单、EID 查询参数、数据哈希用 git add -f 强制纳入（体积小、不易复原）
