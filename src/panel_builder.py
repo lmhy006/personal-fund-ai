@@ -171,5 +171,137 @@ def build_panel():
     return panel
 
 
+def build_panel_v3(out_path: str = None, extra_dirs=None):
+    """panel v3：并入清盘基金 + 截面资格只看当时信息 + **终止标签按「实际收益 + 余下现金」**。
+
+    与 v2（build_panel）的三处差异（用户 2026-09-19 指出 v2 会在训练面板上重新引入幸存者筛选）：
+      1. **数据源**：fund_history + extra_dirs（`fund_history_delisted/`），后者是已清盘/终止基金；
+      2. **资格判定不再要求「标签期末端有披露」**——v2 的这条检查等价于"事前知道该基金六个月后
+         还活着"，会把标签期内终止的基金整行删掉（最差样本消失）；
+      3. **标签三分类**（落盘 `label_resolution` 审计字段）：
+         - `full`            ：标签期末端有披露（15 天容差内）→ W(t+h)/W(t)−1
+         - `terminated_cash` ：**在清盘名单内且净值在标签期末前结束** → 用截至最后净值日的
+                               实际收益 W(last)/W(t)−1，余下时间按现金持有（收益 0）计
+         - `missing`         ：净值在标签期末前中断但**不在清盘名单内**（无法判断是终止还是
+                               长期停披露）→ 标签保留为 NaN，不删行、不伪造
+    审计字段：`terminated_in_label`、`last_nav_date`、`label_resolution`。
+
+    注意：训练时应过滤 `label_resolution != "missing"`（或直接 dropna(标签)）；missing 行保留
+    在面板里是为了**审计与覆盖率统计**，不代表可用样本。
+    """
+    from delisted_funds import FUND_PATH as DELISTED_LIST_PATH   # 清盘名单（代码 + 最早公告日）
+
+    out_path = out_path or os.path.join(PANEL_DIR, "panel_v3.parquet")
+    os.makedirs(PANEL_DIR, exist_ok=True)
+    bench = pd.read_csv(BENCH_PATH, parse_dates=["date"]).sort_values("date")
+    bench_dates = bench["date"].to_numpy(dtype="datetime64[ns]").astype("int64")
+    bench_r_all = bench["close"].pct_change().fillna(0.0).values
+    month_ends = month_end_trading_days(bench_dates)
+    series = load_fund_series(bench_dates, extra_dirs=extra_dirs)
+    name_map = dict(load_fund_name_map())
+    delisted_codes = set()
+    if os.path.exists(DELISTED_LIST_PATH):
+        dl = pd.read_csv(DELISTED_LIST_PATH, dtype={"fund_code": str})
+        delisted_codes = set(dl["fund_code"])
+        if "fund_short_name" in dl.columns:       # 清盘基金名称（现存池名称表里没有它们）
+            name_map.update({r["fund_code"]: r["fund_short_name"] for _, r in dl.iterrows()})
+    print(f"[v3] 研究池 {len(series)} 只（含清盘 {len(set(series) & delisted_codes)} 只）| "
+          f"基准 {len(bench_dates)} 天 | 月末截面 {len(month_ends)} 个")
+
+    rows = []
+    n_months = 0
+    stat = {"full": 0, "terminated_cash": 0, "missing": 0, "rows_no_label_end": 0}
+    for t_ns in month_ends:
+        i_t = int(np.searchsorted(bench_dates, t_ns, side="right")) - 1
+        if i_t < FEATURE_LOOKBACK:
+            continue
+        i_end = i_t + LABEL_HORIZON
+        if i_end >= len(bench_dates):
+            continue                    # 标签期超出数据范围（不是基金终止，是日历到头）
+        w0 = i_t - FEATURE_LOOKBACK
+        label_end_ns = bench_dates[i_end]
+        for code, s in series.items():
+            dates = s["dates"]
+            if dates[0] > t_ns - MIN_AGE_NATURAL_DAYS * DAY_NS:
+                continue
+            j_t = int(np.searchsorted(dates, t_ns, side="right")) - 1
+            if j_t < 0 or t_ns - int(dates[j_t]) > MAX_GAP_DAYS * DAY_NS:
+                continue                # 截面当期无披露（当时的公开信息里它没有净值）
+            rw = s["r_al"][w0:i_t + 1]
+            n_eff = int(np.sum(~np.isnan(rw)))
+            cov = n_eff / (i_t - w0 + 1)
+            if cov < MIN_COVERAGE:
+                continue
+            last_nav_ns = int(dates[-1])
+            terminated = code in delisted_codes and last_nav_ns < label_end_ns - MAX_GAP_DAYS * DAY_NS
+            if terminated:
+                # 标签期内终止：用截至最后净值日的实际收益，余下按现金（0 收益）
+                i_last = int(np.searchsorted(bench_dates, last_nav_ns, side="right")) - 1
+                if i_last <= i_t:
+                    continue            # 终止发生在截面当期之前 → 当期本不该入选
+                label = float(s["wealth_al"][i_last] / s["wealth_al"][i_t] - 1.0)
+                res = "terminated_cash"
+            else:
+                j_end = int(np.searchsorted(dates, label_end_ns, side="right")) - 1
+                if j_end > j_t and label_end_ns - int(dates[j_end]) <= MAX_GAP_DAYS * DAY_NS:
+                    label = float(s["wealth_al"][i_end] / s["wealth_al"][i_t] - 1.0)
+                    res = "full"
+                else:
+                    label = np.nan     # 无法判断（可能是长期停披露/终止但不在名单）
+                    res = "missing"
+            stat[res] += 1
+            ww = s["wealth_al"][w0:i_t + 1]
+            rv = rw[~np.isnan(rw)]
+            age_days = t_ns - dates[0]
+            row = {"fund_code": code, "t_date": pd.Timestamp(t_ns, unit="ns"),
+                   "fund_name": name_map.get(code, ""),
+                   "age_months": round(age_days_to_months(age_days), 1),
+                   "coverage": round(cov, 4)}
+            for name, k in SHORT_WINDOWS.items():
+                row[name] = float(ww[-1] / ww[-1 - k] - 1.0) if n_eff - 1 >= k else np.nan
+            row["vol_12m"] = float(rv.std(ddof=1) * np.sqrt(252)) if n_eff > 2 else np.nan
+            row["sharpe_12m"] = float((rv.mean() - RET_BENCH_RATE) / rv.std(ddof=1) * np.sqrt(252)) \
+                if n_eff > 2 and rv.std(ddof=1) > 0 else np.nan
+            peak = np.maximum.accumulate(ww)
+            row["mdd_12m"] = float(np.nanmin(ww / peak - 1.0))
+            beta, alpha = fund_alpha_beta(rw, w0, i_t, bench_r_all)
+            row["beta_12m"] = beta
+            row["alpha_12m"] = alpha
+            row["future_ret_6m"] = label
+            row["label_end_date"] = pd.Timestamp(label_end_ns, unit="ns")
+            row["terminated_in_label"] = bool(terminated)
+            row["last_nav_date"] = pd.Timestamp(last_nav_ns, unit="ns")
+            row["label_resolution"] = res
+            rows.append(row)
+        n_months += 1
+
+    panel = pd.DataFrame(rows)
+    panel.to_parquet(out_path, index=False)
+    print(f"[v3] 面板构建完成：{out_path}")
+    print(f"[v3] 规模 {len(panel)} 行 | {panel['fund_code'].nunique()} 只基金 | {n_months} 个截面"
+          f" | 截面 {panel['t_date'].min().date()} ~ {panel['t_date'].max().date()}")
+    print(f"[v3] 标签解析：full {stat['full']} | terminated_cash {stat['terminated_cash']} | "
+          f"missing {stat['missing']}")
+    ok = panel[panel["label_resolution"] != "missing"]
+    print(f"[v3] 可用于训练的标签：full+terminated = {len(ok)} 行"
+          f"（其中终止持有 {stat['terminated_cash']} 行）")
+    print(f"[v3] 清盘基金参与：进入可投资截面 {panel[panel.fund_code.isin(delisted_codes)]['fund_code'].nunique()} 只"
+          f" / 共 {len(set(panel[panel.fund_code.isin(delisted_codes)]['fund_code']))} 只名单内")
+    return panel
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="面板构建（v2 现存池 / v3 并入清盘池 + 终止标签）")
+    ap.add_argument("--v3", action="store_true", help="构建 panel v3（并入 fund_history_delisted）")
+    ap.add_argument("--out", default=None, help="输出路径（默认 ml/panel.parquet 或 ml/panel_v3.parquet）")
+    args = ap.parse_args()
+    if args.v3:
+        from delisted_funds import DELISTED_HISTORY_DIR
+        build_panel_v3(out_path=args.out, extra_dirs=[DELISTED_HISTORY_DIR])
+    else:
+        build_panel()
+
+
 if __name__ == "__main__":
-    build_panel()
+    main()

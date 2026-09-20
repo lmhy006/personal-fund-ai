@@ -94,7 +94,11 @@ class WalkForwardSplitter:
         # 预排序视图：每折 searchsorted O(log n) 定位切片，避免逐折全表布尔扫描
         # （pandas 3.0 的 datetime64 默认单位是 us，numpy searchsorted 与 Timestamp 直接混用会炸，
         #   统一显式转 ns——panel_builder 踩过同款坑）
-        self._by_le = self.panel.sort_values("label_end_date", kind="stable")
+        # **训练视图只含标签非空行**（2026-09-19 用户审查）：panel v3 里 `label_resolution="missing"`
+        #   的行标签为 NaN（保留供审计），若混入训练会让模型把 NaN 当目标、或静默丢行破坏"同池比较"。
+        #   测试/预测视图 `_by_t` 仍保留**全部行**（当月横截面要能对全体基金打分）。
+        train_view = self.panel[self.panel[LABEL_COL].notna()]
+        self._by_le = train_view.sort_values("label_end_date", kind="stable")
         self._le_vals = self._by_le["label_end_date"].to_numpy(dtype="datetime64[ns]")
         self._by_t = self.panel.sort_values("t_date", kind="stable")
         self._t_vals = self._by_t["t_date"].to_numpy(dtype="datetime64[ns]")
@@ -161,6 +165,7 @@ class WalkForwardSplitter:
                 continue
             # —— 防泄漏断言（每折强制）——
             cutoff = T - self.publish_lag
+            assert train[LABEL_COL].notna().all(), f"训练集混入标签缺失行 @ {T.date()}"
             assert (train["label_end_date"] < cutoff).all(), f"训练集混入未揭晓标签 @ {T.date()}"
             assert (train["t_date"] < T).all(), f"训练集截面日不早于预测截面 @ {T.date()}"
             assert (test["t_date"] == T).all(), f"测试集非当月横截面 @ {T.date()}"
@@ -249,9 +254,14 @@ def run_baseline(spl: WalkForwardSplitter, features: list[str], phase: str) -> p
 
 
 def print_ic_summary(bdf: pd.DataFrame, features: list[str]) -> None:
-    """按 (feature, age_group) 汇总：有效月（n≥MIN_TEST_ROWS_FOR_IC）的 IC 序列统计。"""
+    """按 (feature, age_group) 汇总：有效月（n≥MIN_TEST_ROWS_FOR_IC）的 IC 序列统计。
+
+    **正式判定用 NW(6) t**（相邻月标签重叠 5 个月 → naive t 高估约 2.3 倍，见 nw_tstat docstring）；
+    naive t 与 p 值一并列出仅供参考（2026-09-19 用户审查要求把 NW 值写进汇总）。
+    """
     print(f"\n=== 基线 Rank IC 汇总（有效月=当月横截面 n≥{MIN_TEST_ROWS_FOR_IC}）===")
-    header = f"{'feature':<14s}{'group':<9s}{'months':>7s}{'mean_IC':>10s}{'std_IC':>9s}{'t-stat':>8s}{'p值':>9s}{'IC>0占比':>10s}"
+    header = (f"{'feature':<14s}{'group':<9s}{'months':>7s}{'mean_IC':>10s}{'std_IC':>9s}"
+              f"{'naive_t':>9s}{'NW(6)t':>9s}{'p值':>9s}{'IC>0占比':>10s}")
     print(header)
     for feat in features:
         for g in ("all", "short", "full", "under12"):
@@ -262,9 +272,11 @@ def print_ic_summary(bdf: pd.DataFrame, features: list[str]) -> None:
             n = len(s)
             mean, sd = float(s.mean()), float(s.std(ddof=1))
             t = mean / (sd / np.sqrt(n))
+            nw = nw_tstat(s)
             p = 2.0 * stats.t.sf(abs(t), n - 1)
-            print(f"{feat:<14s}{g:<9s}{n:>7d}{mean:>10.4f}{sd:>9.4f}{t:>8.2f}{p:>9.3f}{(s > 0).mean():>10.2f}")
-    print("（IC>0占比≈0.5 且 p 值大 = 与随机无异；t-stat 为 IC 序列的均值显著性，非单月）")
+            print(f"{feat:<14s}{g:<9s}{n:>7d}{mean:>10.4f}{sd:>9.4f}{t:>9.2f}{nw:>9.2f}"
+                  f"{p:>9.3f}{(s > 0).mean():>10.2f}")
+    print("（**正式判定看 NW(6)t**；naive_t/p 因标签重叠偏乐观；IC>0占比≈0.5 且 t 小 = 与随机无异）")
 
 
 def main():
@@ -279,6 +291,8 @@ def main():
     ap.add_argument("--holdout-months", type=int, default=DEFAULT_HOLDOUT_MONTHS)
     ap.add_argument("--include-holdout", action="store_true",
                     help="打开最终 holdout（只允许最终验收跑一次；结果单独落盘）")
+    ap.add_argument("--tag", default="",
+                    help="输出文件名后缀（如 _v3panel），避免覆盖既有 v2 产物；缺省与原来一致")
     args = ap.parse_args()
 
     panel = pd.read_parquet(args.panel)
@@ -289,7 +303,7 @@ def main():
                               holdout_months=args.holdout_months)
     os.makedirs(OUT_DIR, exist_ok=True)
     mdf = pd.DataFrame(spl.fold_index())
-    mpath = os.path.join(OUT_DIR, "wf_manifest.csv")
+    mpath = os.path.join(OUT_DIR, f"wf_manifest{args.tag}.csv")
     mdf.to_csv(mpath, index=False)
 
     # —— manifest 审计打印 ——
@@ -317,7 +331,8 @@ def main():
     if args.include_holdout:
         print("\n!!! 正在打开最终 holdout —— 只允许在全部实验拍板后的最终验收时运行一次 !!!")
     bdf = run_baseline(spl, features, phase)
-    bname = "baseline_rankic_holdout.csv" if args.include_holdout else "baseline_rankic.csv"
+    bname = (f"baseline_rankic{args.tag}_holdout.csv" if args.include_holdout
+             else f"baseline_rankic{args.tag}.csv")
     bpath = os.path.join(OUT_DIR, bname)
     bdf.to_csv(bpath, index=False)
     print(f"逐月明细已落盘: {bpath}（{len(bdf)} 行）")

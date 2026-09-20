@@ -252,6 +252,8 @@ def main():
     ap.add_argument("--include-delisted", action="store_true",
                     help="把 data/processed/fund_history_delisted/（已清盘基金）并入研究池"
                          "（幸存者偏差修复；名单覆盖年份有限，见 README 已知局限）")
+    ap.add_argument("--tag", default="",
+                    help="输出文件名后缀（如 _del），避免覆盖现存池产物；缺省与原来一致")
     args = ap.parse_args()
 
     panel_all = pd.read_parquet(PANEL_PATH)
@@ -307,7 +309,8 @@ def main():
                       stratify=args.stratify_type)
     os.makedirs(OUT_DIR, exist_ok=True)
     if not args.no_save:
-        df.to_csv(os.path.join(OUT_DIR, f"portfolio_nav_{args.phase}_top{args.top_n}.csv"),
+        df.to_csv(os.path.join(OUT_DIR,
+                               f"portfolio_nav_{args.phase}{args.tag}_top{args.top_n}.csv"),
                   index=False)
         print(f"逐月明细已落盘（{len(df)} 个月）")
 
@@ -351,14 +354,15 @@ def main():
             ss = summarize(d, f"Top{n}")
             sn.append(ss)
             if not args.no_save:
-                d.to_csv(os.path.join(OUT_DIR, f"portfolio_nav_{args.phase}_top{n}.csv"),
+                d.to_csv(os.path.join(OUT_DIR,
+                                      f"portfolio_nav_{args.phase}{args.tag}_top{n}.csv"),
                          index=False)
         print(f"{'N':>5s}{'年化':>9s}{'波动':>9s}{'夏普':>7s}{'MDD':>9s}{'侵蚀pp':>8s}")
         for ss in sn:
             print(f"{ss['label'][3:]:>5s}{ss['ann_ret']:>9.2%}{ss['vol']:>9.2%}"
                   f"{ss['sharpe']:>7.2f}{ss['mdd']:>9.2%}{ss['fee_drag_pp']:>8.2f}")
     if not args.no_save:
-        with open(os.path.join(OUT_DIR, f"backtest_report_{args.phase}.txt"),
+        with open(os.path.join(OUT_DIR, f"backtest_report_{args.phase}{args.tag}.txt"),
                   "w", encoding="utf-8") as f:
             f.write(report + "\n")
     if args.phase == "holdout":

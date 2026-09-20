@@ -54,5 +54,9 @@ ml/experiments/preds_gbdt_v2align_[abcd]_monthly.csv
 # ===================== Phase 3 中间产物（可再生成，勿提交） =====================
 # 滚动风格/行业暴露缓存（每套 10~28MB，共约 100MB；跑 style_momentum_check.py 可重建）
 ml/backtest/*.parquet
+# panel v3 复核的逐基金预测留存（每份 32MB；用 model_ridge.py --panel ml/panel_v3.parquet 可重建）
+ml/experiments/preds_ridge_v3panel_*_monthly.csv
 # 注：data/ 已整体忽略 → 净值缓存（data/raw/fund_nav/）与清洗视图不再跟踪；
 #     但清盘基金代码台账、失败清单、EID 查询参数、数据哈希用 git add -f 强制纳入（体积小、不易复原）
+# 注：ml/panel_v3.parquet（35.9MB）与 ml/attrs/fund_attrs_monthly.parquet 未忽略——它们是研究基线数据
+#     （与已提交的 ml/panel.parquet 同类），如需瘦身可另行忽略并在 README 标注重建命令
