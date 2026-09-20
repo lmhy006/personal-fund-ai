@@ -524,7 +524,8 @@ python src/feature_group3.py                           # ④ 四规格对照 + H
 - `ml/scores/shadow_YYYY-MM.csv`：两条**中性化影子策略**评分（rank_main/score_main/rank_style_neutral/style_neutral_score/rank_sector_neutral/sector_neutral_score + 暴露与年龄）；首次 2026-09（评分日 2026-09-17，4898 只）
 - `ml/backtest/excess_regime_dev.txt`：**诊断**——组合减可执行全池超额的按状态分解（上行/震荡/下行；含现存池与含清盘池两个来源）
 - `ml/backtest/feature_group3_prereg.md`：第三组特征**预登记**（4 规格 S1~S4、等权标准化合成、判据、Holm 校正、总试验数 4、判定规则）
-- `ml/backtest/feature_group3_dev.txt` + `feature_group3_{S1_baseline,S2_aum,S3_fee,S4_main}_monthly.csv`：第三组四规格对照报告与逐月明细（结论：S4 未通过预登记门槛 → 未检出增量）
+- `ml/backtest/feature_group3_dev.txt` + `feature_group3_{S1_baseline,S2_aum,S3_fee,S4_main}_monthly.csv`：第三组四规格对照报告与逐月明细（结论：S4 未通过预登记门槛 → 在"当前费率历史近似"口径下未检出增量）
+- `ml/backtest/partial_ic_dev.txt` + `partial_ic_{log_aum,flow_share_ratio}_monthly.csv`：**独立信息诊断**（控制 `ret_12m` 的部分 Rank IC）——两项 Holm 后均无稳定正信息 → **正式关闭 AUM/资金流路线**
 - `ml/attrs/fund_attrs_monthly.parquet`：逐月属性特征长表（560,234 行 / 6,683 只；aum/log_aum/flow_share_ratio/fee_*，含 report_date 与 `available_date` 法定滞后）
 - `data/raw/fund_scale/fund_{code}.csv` + `data/raw/fund_fee.csv` + `data/raw/fund_scale_failures.csv`：规模历史（逐只，含 `available_date`＝法定滞后后的"当时可得日"）、当前运作费率、失败清单
 
