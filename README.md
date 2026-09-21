@@ -1,6 +1,6 @@
 # fund_ai
 
-A股公募基金（股票型 + 混合型）数据分析与选基 pipeline：数据拉取 → 探查 → 清洗 → 指标分析 → 图表输出 → 研究样本构建 → 面板数据集。当前完成 **Phase 1**（基金评价系统全链路）、**Phase 1.5**（研究池与数据集建设）与 **Phase 2A**（walk-forward 切分器 + 基线 Rank IC：近一年收益排序 IC=0.093 / 夏普排序 0.085，短历史段与长历史段量级接近）。**Phase 2B**：E1/E2/E1b 线性 + E3 树模型实验完成，经统计审查修正（NW t，n_eff≈42）后所有模型均无增量；runner 对齐评估与逐基金预测留存已完成（对齐后结论不变：单因子 Ridge 与基线完全重合 NW+0.73、树 NW-1.81 不显著）；**战略选择已拍板（2026-09-17）：接受动量基线（近一年收益排序）为第一版候选策略**——特征扩充列独立路线不阻塞；**E4 年龄检验完成**：动量对短/长历史段均适用（组内 IC +0.098/+0.082，NW 均显著）、Top 组年龄构成存在 +4.95pp 系统偏差（NW +2.59，须分段披露）但分层排序无收益增量（NW -0.92）→ **不训练年龄专用模型**；**holdout 终审完成**（IC +0.2608、12/12 月为正、无灾难性失效 → 主策略与评估口径冻结）；**上线评分已扩至全量分层版**（`live_score.py`：主策略 4898 + 低置信度 220 = 5118 只，`ml/scores/2026-09.csv`）；**Phase 3 组合回测 v2 完成**（`backtest_strategy.py`：台账截面选股 / 全池基准同入选时点 / 状态标签无前瞻 → Top50 费用后 11.84%，与**可执行**全池 12.43% 不可分辨 NW t≈-0.08）+ 任务 1 成本对照、任务 2 第一组类型分层（11.97%，NW t=-0.03，无增量）与**第二组滚动风格/行业暴露**（`style_momentum_check.py`：风格中性动量 size-only 段 9.21% vs 原动量 7.39%、月超额 +0.10% 但 **NW t=+0.87 不显著**；含 6 个申万行业板块的**行业中性 5.44% vs 原动量 2.38%（2015-03~，119 月）**、波动与回撤略改善，但 **NW t 仅 +0.24 不显著**；组内动量均无增量；诊断：动量与规模暴露关系跨时期翻转、Top50 组偏中小盘（+0.13~0.17，NW +2.84/+3.24）且低配金融地产（−0.083，NW −2.53）；因子共线性 VIF：size 7.82 偏高）→ **各方案均不构成更换主策略的依据**；**但 vs 全池不显著 ≠ 没有增量**：2026-09-18 补做的**配对检验（方案 vs 原动量）**显示方向一致为正、最强两条为风格中性 **NW +1.84（218 月，累计 +37.65%）**与行业中性 **NW +1.60（119 月，累计 +30.33%）**——10% 边缘、未达 5%，属"未检出显著增量"而非"已证明无增量"（逐月收益已落盘 `ml/backtest/style_variants_*.csv`）；**清盘基金历史池已并入（任务 3，2026-09-18，部分修复）**：改走**证监会 EID 月度窗口扫描**（巨潮 cninfo 实测只覆盖场内、此路不通）→ 名单 **1800 只（场外 1565）**、净值 1758 只、清洗入库 **1756 只** → 研究池 5317 → **7071 只**；并入后行业中性 vs 原动量配对差 **NW +1.60 → +1.73（累计 +30.33% → +33.16%）**、风格中性 +1.84 → +1.82 → **差距不是幸存者偏差造成的**（但 2005–2013 公告库无数据，**属部分修复，不等于已消除**）；**训练面板 v3 完成（任务 4，2026-09-19）**：并入清盘池、截面资格只看当时信息、**终止标签按「截至最后净值的实际收益 + 余下现金持有」**（`label_resolution` = full 417,644 / **terminated_cash 7,571** / missing 20；425,235 行 / 6,233 只）→ 终止审计：清盘基金曾进入截面 **1460 只**、进入 Top50 **151 只（599 月次，月均 2.72）**，而"**记零 vs 资金再分配**"两种处理年化差仅 0.02pp（**NW t=−0.60**）→ **终止处理规则不改变结论**；**两条中性化方案转为影子策略**（`shadow_score.py` → `ml/scores/shadow_2026-09.csv`，主策略仍为原动量不更换，转正需同时满足"超原动量 + 超可执行全池 + 风险换手未恶化"，6 个月标签成熟需等到 2027-03 后）。**第三组特征已完成（2026-09-19）：未检出增量**——AUM/费率/资金流按预登记的 4 规格（等权 z-score 合成）全部**低于**基线（S4 主规格 6.58% vs 基线 7.70%，波动 20.34% vs 23.09%），配对差在 **Holm 校正后 p=0.173**（总试验数 4）；波动下降来自等权合成**稀释动量权重**（1.0→1/4），**不能解读为"这些特征是负向信号"**；按预登记纪律**停在这条线**。**下一步：组合构建其余部分（用户已同意排在特征之后）→ Agent**。
+A股公募基金（股票型 + 混合型）数据分析与选基 pipeline：数据拉取 → 探查 → 清洗 → 指标分析 → 图表输出 → 研究样本构建 → 面板数据集。当前完成 **Phase 1**（基金评价系统全链路）、**Phase 1.5**（研究池与数据集建设）与 **Phase 2A**（walk-forward 切分器 + 基线 Rank IC：近一年收益排序 IC=0.093 / 夏普排序 0.085，短历史段与长历史段量级接近）。**Phase 2B**：E1/E2/E1b 线性 + E3 树模型实验完成，经统计审查修正（NW t，n_eff≈42）后所有模型均无增量；runner 对齐评估与逐基金预测留存已完成（对齐后结论不变：单因子 Ridge 与基线完全重合 NW+0.73、树 NW-1.81 不显著）；**战略选择已拍板（2026-09-17）：接受动量基线（近一年收益排序）为第一版候选策略**——特征扩充列独立路线不阻塞；**E4 年龄检验完成**：动量对短/长历史段均适用（组内 IC +0.098/+0.082，NW 均显著）、Top 组年龄构成存在 +4.95pp 系统偏差（NW +2.59，须分段披露）但分层排序无收益增量（NW -0.92）→ **不训练年龄专用模型**；**holdout 终审完成**（IC +0.2608、12/12 月为正、无灾难性失效 → 主策略与评估口径冻结）；**上线评分已扩至全量分层版**（`live_score.py`：主策略 4898 + 低置信度 220 = 5118 只，`ml/scores/2026-09.csv`）；**Phase 3 组合回测 v2 完成**（`backtest_strategy.py`：台账截面选股 / 全池基准同入选时点 / 状态标签无前瞻 → Top50 费用后 11.84%，与**可执行**全池 12.43% 不可分辨 NW t≈-0.08）+ 任务 1 成本对照、任务 2 第一组类型分层（11.97%，NW t=-0.03，无增量）与**第二组滚动风格/行业暴露**（`style_momentum_check.py`：风格中性动量 size-only 段 9.21% vs 原动量 7.39%、月超额 +0.10% 但 **NW t=+0.87 不显著**；含 6 个申万行业板块的**行业中性 5.44% vs 原动量 2.38%（2015-03~，119 月）**、波动与回撤略改善，但 **NW t 仅 +0.24 不显著**；组内动量均无增量；诊断：动量与规模暴露关系跨时期翻转、Top50 组偏中小盘（+0.13~0.17，NW +2.84/+3.24）且低配金融地产（−0.083，NW −2.53）；因子共线性 VIF：size 7.82 偏高）→ **各方案均不构成更换主策略的依据**；**但 vs 全池不显著 ≠ 没有增量**：2026-09-18 补做的**配对检验（方案 vs 原动量）**显示方向一致为正、最强两条为风格中性 **NW +1.84（218 月，累计 +37.65%）**与行业中性 **NW +1.60（119 月，累计 +30.33%）**——10% 边缘、未达 5%，属"未检出显著增量"而非"已证明无增量"（逐月收益已落盘 `ml/backtest/style_variants_*.csv`）；**清盘基金历史池已并入（任务 3，2026-09-18，部分修复）**：改走**证监会 EID 月度窗口扫描**（巨潮 cninfo 实测只覆盖场内、此路不通）→ 名单 **1800 只（场外 1565）**、净值 1758 只、清洗入库 **1756 只** → 研究池 5317 → **7071 只**；并入后行业中性 vs 原动量配对差 **NW +1.60 → +1.73（累计 +30.33% → +33.16%）**、风格中性 +1.84 → +1.82 → **差距不是幸存者偏差造成的**（但 2005–2013 公告库无数据，**属部分修复，不等于已消除**）；**训练面板 v3 完成（任务 4，2026-09-19）**：并入清盘池、截面资格只看当时信息、**终止标签按「截至最后净值的实际收益 + 余下现金持有」**（`label_resolution` = full 417,644 / **terminated_cash 7,571** / missing 20；425,235 行 / 6,233 只）→ 终止审计：清盘基金曾进入截面 **1460 只**、进入 Top50 **151 只（599 月次，月均 2.72）**，而"**记零 vs 资金再分配**"两种处理年化差仅 0.02pp（**NW t=−0.60**）→ **终止处理规则不改变结论**；**两条中性化方案转为影子策略**（`shadow_score.py` → `ml/scores/shadow_2026-09.csv`，主策略仍为原动量不更换，转正需同时满足"超原动量 + 超可执行全池 + 风险换手未恶化"，6 个月标签成熟需等到 2027-03 后）。**第三组特征已完成（2026-09-19）：未检出增量**——AUM/费率/资金流按预登记的 4 规格（等权 z-score 合成）全部**低于**基线（S4 主规格 6.58% vs 基线 7.70%，波动 20.34% vs 23.09%），配对差在 **Holm 校正后 p=0.173**（总试验数 4）；波动下降来自等权合成**稀释动量权重**（1.0→1/4），**不能解读为"这些特征是负向信号"**；按预登记纪律**停在这条线**。**风险控制 v1（2026-09-19）：风险目标达成但转正门槛未全过**（MDD −54.61%→−38.04%、Sharpe 0.42→0.48、年化保留 94.8%，但相对同样风控的全池未显化→不转正；保留为情景分析工具）。**Phase 3.5（当前进行）**：统一生产流水线 `production_pipeline.py`（一条命令：基准→raw→full 清洗→健康检查 PASS/WARN/FAIL→live_score→shadow_score（因子 stale 则跳过记录）→live_portfolio（6-cohort ledger，首五个月建仓=方案 A 逐步 1/6）→**不可变快照** `ml/snapshots/{run_id}/`）；时间语义 `data_cutoff/signal_date/score_generated_at/execution_date` 已定义，真实申购成交规则无可靠证据列为 production limitation；已端到端跑通（2026-09-18 评分，5118 只）。
 
 ## 环境搭建
 
@@ -41,19 +41,29 @@ fund_ai/
 │   ├── fund_attrs.py                # Phase3 任务5：属性数据抓取（东财 F10 规模历史 → AUM/资金流；运作费率）
 │   ├── excess_regime.py             # Phase3 诊断：组合−可执行全池超额的按状态分解（只诊断，不制定规则）
 │   ├── run_dev_download_clean.py    # 开发池拉取+清洗驱动（后台挂机用）
-│   └── run_full_download_clean.py   # 全量拉取+清洗驱动（phase2正式实验前用）
+│   ├── run_full_download_clean.py   # 全量拉取+清洗驱动（phase2正式实验前用）
+│   ├── data_health.py               # Phase3.5：生产数据健康检查（13 项指标 + PASS/WARN/FAIL，重要缺口 FAIL）
+│   ├── live_portfolio.py            # Phase3.5：6-cohort ledger 生产组合（首五个月建仓=方案A逐步建仓，已写死）
+│   └── production_pipeline.py       # Phase3.5：统一生产入口（一条命令：刷新→清洗→健康→评分→影子→组合→不可变快照）
 ├── data/
 │   ├── raw/                   # 原始层：基金池、fund_nav/全历史净值缓存(1676只)、benchmark_hs300.csv
 │   ├── processed/
 │   │   ├── fund_processed/    # current模式：三年严格共同窗口(2023-09~2026-09) 1493只 + clean_report.csv(含fund_name/coverage_ratio/zero_ret_cnt)
-│   │   ├── fund_history/      # full模式：完整历史 1500只 + clean_history_report.csv
+│   │   ├── fund_history/      # full模式：完整历史（现存池，fund_code_list 限定清洗） + clean_history_report.csv
+│   │   ├── fund_history_delisted/  # 清盘基金独立目录（delisted_funds.py --clean-history 生成，与现存池分开）
+│   │   ├── fund_history_index.csv  # 全量历史池索引（fund_code/source/first_date/last_date，覆盖率与池规模溯源）
 │   │   └── *_tmp / *_backup/  # swap临时与备份目录（正常状态下自动消失）
 │   └── analyze/               # Phase1分析视图：analysis_summary.csv + charts/三联图
 └── ml/
-    ├── panel.parquet          # fund-month面板（126,124行/1499只/278个月末截面 2003-01~2026-02）
-    ├── wf_splits/             # Phase2A：wf_manifest.csv（逐折切分审计）+ baseline_rankic.csv（基线RankIC逐月明细）
-    ├── experiments/           # Phase2B：ridge_{tag}/gbdt_{tag}_monthly.csv 各实验变体逐月明细
-    └── scores/                # （预留）每月正式评分快照，积累向前验证记录
+    ├── panel.parquet          # fund-month面板（v2：开发池 126,124行/1,499只/278截面）
+    ├── panel_v3.parquet      # 训练面板 v3（并入清盘池、资格只看当时信息：425,235行/6,233只）
+    ├── wf_splits/             # Phase2A：wf_manifest{basis}.csv + baseline_rankic{basis}.csv（--tag 区分 v2/v3）
+    ├── experiments/           # Phase2B：ridge_{tag}/gbdt_{tag}_monthly.csv；v3panel 复核产物（注意 Ridge 目标错位定性）
+    ├── backtest/              # Phase3：回测报告/逐月明细/风格与行业暴露/终止审计/风控 v1/第三组与部分 IC 诊断
+    ├── scores/                # 每月正式评分快照（ml/scores/YYYY-MM.csv + shadow_YYYY-MM.csv）
+    ├── attrs/                 # 第三组属性特征（fund_attrs_monthly.parquet，560k 行）
+    ├── ledger/                # Phase3.5：live_portfolio 的 cohort ledger（portfolio_ledger.csv / portfolio_state.json）
+    └── snapshots/             # Phase3.5：不可变快照（{run_id}/manifest.json + 评分/影子/ledger/health 副本；legacy/ 保留被覆盖的旧评分）
 ```
 
 ## 运行顺序
@@ -163,6 +173,14 @@ python src/ridge_sign_diag.py                          # 逐折记录 coef_/X'y/
 python src/vol_target.py                               # 固定主规格（目标 15%、不杠杆、不搜参）+ 四组对照 + 验收门槛
 #   ⚠️ vol_target 固定口径**不遍历窗口与目标波动率**；未达标（本轮第 5 条以噪声级差异未过）即停止
 #   ⚠️ 第④组（波动目标全池等权）是必需的对照：缺它无法区分"动量被改善"与"任何风险资产降仓的机械结果"
+
+# 16. Phase 3.5 生产流水线（一条命令：数据刷新 → 正式评分 → 组合 → 不可变快照）
+python src/data_health.py                                   # 健康检查独立运行（只读；FAIL=禁止评分）
+python src/live_portfolio.py --scores ml/scores/YYYY-MM.csv # 维护 6-cohort ledger（幂等，方案A建仓已写死）
+python src/production_pipeline.py                           # 完整生产入口（刷新+清洗+健康+评分+影子+组合+快照）
+python src/production_pipeline.py --skip-refresh            # 测试/重试：跳过数据刷新（只评分+组合+快照）
+#   ⚠️ 任何关键步骤 FAIL → 后续评分中止，不用旧数据静默输出；快照在 ml/snapshots/{run_id}/
+#   ⚠️ 影子评分依赖风格/行业因子缓存；因子 stale（早于打分日）→ 影子明确跳过并记录原因
 ```
 
 ## 指标口径（重要）
@@ -528,7 +546,94 @@ python src/vol_target.py                               # 固定主规格（目�
 | 年均新增费用 ≤ 0.5pp | **0.129pp** | ✅ |
 | 相对同样风控的全池未进一步恶化 | 月均 **−0.0129%**（NW −0.14） | ❌（差 0.0001） |
 
-→ **总判定：未达标 → 停止，不遍历窗口与目标波动率**（按用户纪律）。**解读（第④组的价值）**：波动目标确实把回撤从 −54.6% 压到 −38.0%、Sharpe 从 0.42 升到 0.48，**但同样风控的全池组改善更多**（MDD −33.5%、Sharpe 0.51、年化 9.16% > 8.86%）→ **这些改善主要是"任何风险资产降仓"的机械结果，而非动量策略层面的增量**；②−④ 的月均差 −0.0129%（NW −0.14）在统计上不可分辨，所以第五条的"未过"是**门槛的严格性**，不是发现了恶化。**结论**：波动目标作为**风险管理**有效（改善回撤与持有体验），但**没有为动量策略本身创造增量** → 不进入影子运行；主策略仍为原动量、不更换。
+**状态（2026-09-19 用户修正措辞）**：**风险目标达成，但策略转正门槛未全部通过**。即——
+
+> 事前波动目标**成功实现了风险控制目的**（MDD **−54.61% → −38.04%**、波动 **23.32% → 16.56%**、年化保留 **94.8%**、Sharpe **0.42 → 0.48**、新增费用约 **0.129pp/年**），但**没有证明它为动量选基带来了区别于"全池降仓"的额外价值**，因此按预登记规则**不转为默认策略、不进入影子运行**。
+
+**第五条门槛的实现偏差（诚实记录，2026-09-19）**：预登记文字"相对同样风控的全池未进一步恶化"严格来说应检验 **difference-in-differences**：`(VT动量−VT全池) − (原动量−原全池)`。当前 `vol_target.py` 实际执行的是**风控后横向比较** `VT动量 − VT全池 ≥ 0`。逐月重算（与 `vol_target_monthly.csv` 一致）：
+
+| 序列 | 月均差 | NW(6) t |
+|---|---|---|
+| 原动量 − 原全池 | +0.0233% | +0.20 |
+| 风控动量 − 风控全池 | −0.0129% | −0.14 |
+| **差的差（DiD，事后补算）** | **−0.0362%** | **−0.60** |
+
+解释：**无论采用当前门槛（横向比较）还是差分诊断，都没有统计证据证明动量经过波动控制后发生显著恶化，也没有证据证明存在动量特有的风险调整增量**（全部 |NW| < 1）。"不转正、不进入影子运行"的决定保持不变——**不因已经看到结果而修改预登记规则使实验通过**。
+
+**工具定位**：`src/vol_target.py` **保留**，作为① 风险覆盖层的研究实现；② 情景分析工具；③ Agent 未来回答"若采用 15% 目标波动率历史表现如何"的工具。它**不进入默认 live strategy，也不进入影子策略**。
+
+## Phase 2/3 冻结与 Phase 3.5（Research → Production，2026-09-19）
+
+### 一、Phase 2 模型竞赛正式关闭（冻结）
+
+Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/训练行数/填补比例 + 三种拟合口径）：
+
+- 原口径：负系数月 **40**、反号月 **40**，**一一对应**；与已落盘 `model_ridge` 逐月结果 **237/237 对齐**；负系数集中在 2015-12~2018-01（26 折）与 2019-04~2020-05（14 折）；
+- 月内百分位排名特征（仅诊断）把反号降到 **8**、模型 IC 由 −0.0006 升到 **+0.0360**；
+- 只用非缺失训练行只降到 39 → **缺失填补不是主因**。
+
+**定性**：Ridge 反号**不是 pipeline bug**，而是 **训练目标（pooled MSE，样本多/振幅大的月份权重大）与最终评价目标（逐月横截面 Rank IC、按月等权）不一致**。**不再为修复 Ridge 开发新的 ranking loss / LambdaMART / RankNet 等模型。**
+
+> **Phase 2 冻结结论：当前实验中没有可靠证据表明复杂 ML 能稳定超越简单的一年动量排序，因此第一版主信号继续采用 `ret_12m`。**
+
+### 二、Phase 3 历史研究冻结
+
+- **主策略（冻结）**：`ret_12m` 排序 Top50 等权、每月调仓持 6 月、申赎费 0.15%/0.5%——口径见 `backtest_strategy.py`；
+- **Project 结论记录**：动量存在横截面排序信息（dev IC ≈ 0.07~0.09、v3 面板 NW +2.15），但**费用后 Top50 相对可执行全池的组合超额尚未得到可靠统计证据**（NW ≈ 0，正负号不稳）；
+- **风格中性 / 行业中性**：继续作为 **shadow strategies**（`shadow_score.py`），不参与真实资金决策，按既定规则积累 forward data；2026-09 首批评分的 6 个月标签需到 **2027-03 以后**才能完整成熟；
+- **风险控制 v1**：见上节——风险目标达成、转正门槛未全过，保留为情景分析工具；
+- 新的策略研究若未来重启，**必须视作新的 research cycle 并重新预登记**；已看过的 holdout **不再充当任何新设计的盲测**。
+
+### 三、Phase 3.5：Research → Production（当前进行）
+
+目标不是"哪个策略更好"，而是**保证冻结的策略按与研究一致的 no-lookahead 口径稳定运行、可复现、失败显式**。
+
+**模块**（本轮新增）：
+
+| 模块 | 职责 |
+|---|---|
+| `src/data_health.py` | 13 项健康指标 + **PASS/WARN/FAIL**；重要缺口（processed 未刷新/raw 缺口中位过大/benchmark 过旧）**必须 FAIL**，不只是 warning |
+| `src/production_pipeline.py` | 统一生产入口：**一条命令**＝基准更新→raw 更新→full 清洗（现存+清盘）→data_health→live_score→shadow_score（因子 stale 则跳过并记录）→live_portfolio→不可变 snapshot；任何关键步骤 FAIL 即中止评分 |
+| `src/live_portfolio.py` | **6-cohort ledger**：每月一批 Top50、每批持 6 月、最多 6 批并存；记录建仓月/signal/execution/权重/active/到期/新增/到期/聚合目标权重/预计申赎与费用 |
+| `ml/snapshots/{run_id}/` | 不可变快照：manifest（run_id/commit SHA/strategy version/data_cutoff/benchmark_cutoff/factor_cutoff/signal_date/score_generated_at/execution_date/universe/eligible/Top50/score hash/ledger/聚合组合/health）+ 评分/影子/ledger 副本 |
+
+**时间语义（定义，训练 lag ≠ 交易时点）**：`walk_forward_splitter` 的 5 个自然日 lag 是**历史标签结束后等待多久才允许该标签进训练集**，**不是**"月末信号产生后基金何时能真实成交"。生产口径单独定义：
+
+- `data_cutoff`＝评分用的数据截止日（= 基准最新交易日）
+- `signal_date`＝信号产生日（= data_cutoff，用 ≤ 该日的净值计算）
+- `score_generated_at`＝评分实际生成时刻
+- `execution_date`＝调仓可执行日（= 信号日后下一个基准交易日，**production assumption**）
+
+**Production limitations（无可靠证据，不猜测）**：① 月末基金净值**真实公开可见**的时间；② 系统完成评分所需的实际耗时；③ 投资者**最早可提交申购**的时间；④ 申购**按哪一天净值成交**（基金公司/销售机构规则）；⑤ 回测收益起点与真实申购规则的对应。这些列为 limitation，待拿到可靠证据（基金公告/券商规则）后修正 `execution_date` 语义。
+
+**首五个月建仓（已写死，方案 A）**：六个月逐步建仓——第 k 月累计风险仓位 k/6、每批 cohort 权重恒 1/6、未投部分**显式建模为现金**（2%/年）。已在 `live_portfolio.py` 顶部写死并在本 README 记录；与历史回测 dev 段 warm-up 的隐含语义（active cohort 等权平均 1/n_held、未建模现金）在 **n_held=6 的 steady state 完全一致**，前 5 个月语义被明确化；**不基于历史收益选择 A/B**（方案 B 首月满仓如需启用，须先改常量并重新记录）。
+
+**对账**：pipeline 调用 `live_score.verify_against_panel`（与历史研究面板同口径逐基金对账；研究面板截面止于标签完整处，超出截面时记录 skip 原因）。
+
+### 四、不可变快照（目标）
+
+> **2027 年回头验证 2026 年 9 月的预测时，能够恢复"当时系统真正看见了什么"，而不是用 2027 年的数据库重新构造假历史。**
+
+每次正式月度评分/组合生成都留 `ml/snapshots/{run_id}/`；覆盖 `ml/scores/YYYY-MM.csv` 前先备份旧版到 `ml/snapshots/legacy/`。
+
+### 五、Phase 4 Agent 权限边界（现在写进设计）
+
+- **Agent 可以调用**：production pipeline、data health、live score、shadow score、live portfolio、历史快照、基金分析工具、风险情景分析（vol_target）、报告生成；
+- **Agent 不允许**：修改 Top N / lookback / hold period / 费用 / eligibility / 显著性阈值、遍历超参数、重新调模型、修改 risk target、把 shadow 转正、把 vol target 转默认策略——**这些全部属于新研究假设，必须退出 production workflow 重进 research workflow**（重新预登记）。
+
+### 六、状态汇总（2026-09-19）
+
+| Phase | 状态 |
+|---|---|
+| Phase 0/1 | 完成 |
+| Phase 1.5 | 完成 |
+| Phase 2A | 完成 |
+| Phase 2B | **完成并冻结**：复杂模型无可靠增量，主信号 `ret_12m` |
+| Phase 3 | **主要历史研究完成并冻结**（回测池含部分清盘基金；清盘名单覆盖 2014 后、属部分修复，**未声明幸存者偏差已彻底解决**） |
+| 风险控制 v1 | **风险目标达成，但策略转正门槛未全部通过**（保留为情景分析工具） |
+| Shadow strategies | **forward observation 中**（2026-09 起，标签 2027-03 后成熟） |
+| **Phase 3.5** | **当前进行**（生产流水线/健康检查/组合 ledger/不可变快照） |
+| Phase 4 | 待 Phase 3.5 完成后开始（Agent 只调用已验证工具，权限边界见上） |
 
 **研究目标（2026-09-18 重述）**：特征扩充的目的是**找到费用后稳定的组合增量**（相对全池），不是"让 ML 指标超过动量"；每组以费用后相对全池收益、回撤与分阶段表现评价，IC 仅作辅助；只在 dev 段内按时间滚动取舍。**清盘基金边界**：清盘历史池已部分并入（任务 3），但**并未消除**幸存者偏差——对外表述仍应为"现存 + 部分已清盘池的条件性历史研究"。**多重比较纪律（2026-09-19）**：第二组共试了 6 个相关方案、最高配对 NW 仅 +1.84，继续大量试规格会抬高偶然"最佳方案"的概率（数据窥探）——第三组已**预登记 4 个规格**（见任务 5 与 `ml/backtest/feature_group3_prereg.md`），非基线规格用 **Holm 校正**并报告总试验数。
 
@@ -564,7 +669,9 @@ python src/vol_target.py                               # 固定主规格（目�
 - `ml/backtest/feature_group3_dev.txt` + `feature_group3_{S1_baseline,S2_aum,S3_fee,S4_main}_monthly.csv`：第三组四规格对照报告与逐月明细（结论：S4 未通过预登记门槛 → 在"当前费率历史近似"口径下未检出增量）
 - `ml/backtest/partial_ic_dev.txt` + `partial_ic_{log_aum,flow_share_ratio}_monthly.csv`：**独立信息诊断**（控制 `ret_12m` 的部分 Rank IC）——两项 Holm 后均无稳定正信息 → **正式关闭 AUM/资金流路线**
 - `ml/backtest/ridge_sign_diag.txt` + `ridge_sign_diag_monthly.csv`：Ridge 反号的定点诊断（逐折 `coef_`/`X'y`/训练行数/填补比例 + 三种拟合口径对照）→ 定性为「池化 MSE 与月度排序目标不一致」
-- `ml/backtest/vol_target_dev.txt` + `vol_target_monthly.csv`：风险控制 v1（事前波动目标）四组对照报告与逐月仓位/成本明细（结论：四过一未过 → 停止）
+- `ml/backtest/vol_target_dev.txt` + `vol_target_monthly.csv`：风险控制 v1（事前波动目标）四组对照报告与逐月仓位/成本明细（**状态：风险目标达成，策略转正门槛未全部通过**；第五条门槛实现为横向比较，DiD 事后补算 −0.0362%/月 NW −0.60，见 Phase 2/3 冻结章节）
+- `ml/snapshots/{run_id}/`（manifest.json + 评分/影子/ledger/health 副本 + top50.csv + score hash）+ `ml/snapshots/legacy/`：**Phase 3.5 不可变快照**（覆盖 ml/scores 前先备份旧版，保证可复原"当时系统看见了什么"）
+- `ml/ledger/portfolio_ledger.csv` + `portfolio_state.json`：Phase 3.5 生产组合的 6-cohort ledger（建仓月/signal/execution/权重/active/到期/聚合目标权重/预计申赎与费用）
 - `ml/attrs/fund_attrs_monthly.parquet`：逐月属性特征长表（560,234 行 / 6,683 只；aum/log_aum/flow_share_ratio/fee_*，含 report_date 与 `available_date` 法定滞后）
 - `data/raw/fund_scale/fund_{code}.csv` + `data/raw/fund_fee.csv` + `data/raw/fund_scale_failures.csv`：规模历史（逐只，含 `available_date`＝法定滞后后的"当时可得日"）、当前运作费率、失败清单
 
