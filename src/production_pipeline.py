@@ -239,6 +239,72 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
     return snap
 
 
+def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
+                 as_of: str | None = None) -> dict:
+    """可编程生产入口（Phase 4 Agent 薄工具层只调用**完整路径**：skip_* 均 False、as_of=None）。
+
+    :return: {"run_id", "snapshot", "manifest", "status"}；任一关键步骤失败抛异常（调用方
+             捕获后返回 aborted）。skip_* 用于 CLI 诊断/重试，对应快照只写 NOT_COMPLETE_TEST。
+    """
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log(f"run_id={run_id}（commit={git_head_sha()[:8]}）")
+
+    health = None
+    scores_path = None
+    if not skip_refresh:
+        step_benchmark()
+        step_raw()
+        if not skip_clean:
+            step_clean()
+    else:
+        log("（skip_refresh：跳过数据刷新）")
+
+    health = step_health()
+    if health["status"] == "FAIL":
+        raise RuntimeError(f"data_health FAIL（{health.get('shadow_stale', '')}）→ 中止评分")
+
+    as_of_ts = pd.Timestamp(as_of) if as_of else None
+    scores_df, t_date, scores_path, score_meta = step_live_score(as_of_ts)
+    data_cutoff = t_date
+    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
+    pf, action, agg = step_portfolio(scores_df, t_date, run_id)
+
+    main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
+    top50 = main.sort_values("rank").head(TOP_N) if "rank" in main.columns else \
+        main.sort_values("score", ascending=False).head(TOP_N)
+    manifest = {
+        "run_id": run_id, "git_commit_sha": git_head_sha(),
+        "strategy_version": STRATEGY_VERSION,
+        "data_cutoff": str(data_cutoff.date()),
+        "benchmark_cutoff": str(health["benchmark_latest_date"]),
+        "factor_cutoff": health.get("shadow_factors"),
+        "signal_date": str(data_cutoff.date()),
+        "score_generated_at": datetime.now().isoformat(timespec="seconds"),
+        # 基准日历止于 data_cutoff 时无下一交易日 → None（null/pending），不得退回 signal_date
+        "execution_date": next_trading_day(data_cutoff),
+        "script_hashes": script_hashes(),
+        "universe_size": health.get("processed_funds") or health.get("raw_funds"),
+        "eligible_size": int(len(scores_df)),
+        "main_size": score_meta["main"], "low_size": score_meta["low"],
+        "score_meta": score_meta, "shadow_stale": shadow_stale,
+        "data_health_status": health["status"],
+        "execution_semantics": "signal_date=评分日；execution_date=信号日后下一基准交易日；"
+                               "基准日历止于 data_cutoff 时 execution_date=null（cohort 保持 "
+                               "planned/pending，成交日确认后才 active，见 live_portfolio 的 "
+                               "confirm_execution）",
+    }
+    snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
+                         test_mode=bool(skip_refresh or skip_clean))
+    with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
+    log("✅ 流水线完成；正式评分与快照已生成"
+        if manifest["status"] == "complete" else
+        "⚠️ 流水线完成，但本次为**测试运行**（含 skip 开关），快照已标 NOT_COMPLETE_TEST，非正式记录")
+    log(f"  下一步：Agent 可读取 {snap}/manifest.json 复原'当时系统看见了什么'")
+    return {"run_id": run_id, "snapshot": snap, "manifest": manifest,
+            "status": manifest["status"]}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Phase 3.5 统一生产流水线（一条命令：数据刷新→正式评分→组合→快照）")
     ap.add_argument("--as-of", default=None, help="评分日 YYYY-MM-DD；缺省=净值最新交易日")
@@ -246,68 +312,14 @@ def main():
     ap.add_argument("--skip-clean", action="store_true", help="跳过 full 清洗（数据未变时的快速路径）")
     args = ap.parse_args()
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log(f"run_id={run_id}（commit={git_head_sha()[:8]}）")
-
-    health = None
-    scores_path = None
     try:
-        if not args.skip_refresh:
-            step_benchmark()
-            step_raw()
-            if not args.skip_clean:
-                step_clean()
-        else:
-            log("（--skip-refresh：跳过数据刷新）")
-
-        health = step_health()
-        if health["status"] == "FAIL":
-            raise RuntimeError(f"data_health FAIL（{health.get('shadow_stale', '')}）→ 中止评分")
-
-        as_of = pd.Timestamp(args.as_of) if args.as_of else None
-        scores_df, t_date, scores_path, score_meta = step_live_score(as_of)
-        data_cutoff = t_date
-        shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
-        pf, action, agg = step_portfolio(scores_df, t_date, run_id)
-
-        main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
-        top50 = main.sort_values("rank").head(TOP_N) if "rank" in main.columns else \
-            main.sort_values("score", ascending=False).head(TOP_N)
-        manifest = {
-            "run_id": run_id, "git_commit_sha": git_head_sha(),
-            "strategy_version": STRATEGY_VERSION,
-            "data_cutoff": str(data_cutoff.date()),
-            "benchmark_cutoff": str(health["benchmark_latest_date"]),
-            "factor_cutoff": health.get("shadow_factors"),
-            "signal_date": str(data_cutoff.date()),
-            "score_generated_at": datetime.now().isoformat(timespec="seconds"),
-            # 基准日历止于 data_cutoff 时无下一交易日 → None（null/pending），不得退回 signal_date
-            "execution_date": next_trading_day(data_cutoff),
-            "script_hashes": script_hashes(),
-            "universe_size": health.get("processed_funds") or health.get("raw_funds"),
-            "eligible_size": int(len(scores_df)),
-            "main_size": score_meta["main"], "low_size": score_meta["low"],
-            "score_meta": score_meta, "shadow_stale": shadow_stale,
-            "data_health_status": health["status"],
-            "execution_semantics": "signal_date=评分日；execution_date=信号日后下一基准交易日；"
-                                   "基准日历止于 data_cutoff 时 execution_date=null（cohort 保持 "
-                                   "planned/pending，成交日确认后才 active，见 live_portfolio 的 "
-                                   "confirm_execution）",
-        }
-        snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
-                             test_mode=bool(args.skip_refresh or args.skip_clean))
-        with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
-            f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
-        log("✅ 流水线完成；正式评分与快照已生成"
-            if manifest["status"] == "complete" else
-            "⚠️ 流水线完成，但本次为**测试运行**（含 skip 开关），快照已标 NOT_COMPLETE_TEST，非正式记录")
-        log(f"  下一步：Agent 可读取 {snap}/manifest.json 复原'当时系统看见了什么'")
+        run_pipeline(args.skip_refresh, args.skip_clean, args.as_of)
     except Exception as e:  # noqa: BLE001
         log(f"❌ 流水线中止：{e}")
         traceback.print_exc()
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(os.path.join(LOG_DIR, "production_pipeline_abort.log"), "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now().isoformat(timespec='seconds')} run={run_id} ABORT: {e}\n")
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} ABORT: {e}\n")
         raise SystemExit(1)
 
 

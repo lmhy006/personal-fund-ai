@@ -44,7 +44,10 @@ fund_ai/
 │   ├── run_full_download_clean.py   # 全量拉取+清洗驱动（phase2正式实验前用）
 │   ├── data_health.py               # Phase3.5：生产数据健康检查（13 项指标 + PASS/WARN/FAIL，重要缺口 FAIL）
 │   ├── live_portfolio.py            # Phase3.5：6-cohort ledger 生产组合（首五个月建仓=方案A逐步建仓，已写死）
-│   └── production_pipeline.py       # Phase3.5：统一生产入口（一条命令：刷新→清洗→健康→评分→影子→组合→不可变快照）
+│   ├── production_pipeline.py       # Phase3.5：统一生产入口（run_pipeline() 可编程；main 仅解析 CLI）
+│   └── agent_tools.py               # Phase4：薄工具层（10 只读工具 + 无参数 run_production_pipeline；审计 logs/agent_audit/）
+├── tests/
+│   └── test_agent_tools.py          # Phase4：T5 签名/白名单/只读性测试（fixture，11 项）
 ├── data/
 │   ├── raw/                   # 原始层：基金池、fund_nav/全历史净值缓存(1676只)、benchmark_hs300.csv
 │   ├── processed/
@@ -181,6 +184,13 @@ python src/production_pipeline.py                           # 完整生产入口
 python src/production_pipeline.py --skip-refresh            # 测试/重试：跳过数据刷新（只评分+组合+快照）
 #   ⚠️ 任何关键步骤 FAIL → 后续评分中止，不用旧数据静默输出；快照在 ml/snapshots/{run_id}/
 #   ⚠️ 影子评分依赖风格/行业因子缓存；因子 stale（早于打分日）→ 影子明确跳过并记录原因
+
+# 17. Phase 4 薄工具层（src/agent_tools.py；按 docs/PHASE4_AGENT_SCHEMA.md v1.1）
+python src/agent_tools.py get_data_health                 # 统一调用入口：10 只读工具 + run_production_pipeline
+python src/agent_tools.py get_score '{"month": "2026-09"}'
+python -m unittest tests.test_agent_tools -v              # T5 测试（fixture，不运行真实流水线、不改真实 ledger）
+#   ⚠️ 只读工具不改 scores/ledger/snapshots，仅写 logs/agent_audit/；评分一律读 ml/snapshots/{run_id}/ 内 CSV
+#   ⚠️ run_production_pipeline() 无参数 = 完整正式流程；skip/as_of/策略参数一律拒绝（research_boundary）
 ```
 
 ## 指标口径（重要）
@@ -633,7 +643,7 @@ Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/
 | 风险控制 v1 | **风险目标达成，但策略转正门槛未全部通过**（保留为情景分析工具） |
 | Shadow strategies | **forward observation 中**（2026-09 起，标签 2027-03 后成熟） |
 | **Phase 3.5** | **完成（2026-09-21 验收通过）**：生产流水线/健康检查/组合 ledger/不可变快照；正式快照 `20260921_104949`（status=complete、SHA 可复现） |
-| Phase 4 | **设计阶段（Schema v1.1 已定稿 2026-09-22）**：工具契约/权限矩阵/错误处理与停止条件实测见 `docs/PHASE4_AGENT_SCHEMA.md` 与 `docs/PHASE4_FAILURE_SCENARIOS.md`（5 项实测，T5 待薄工具层验证）；先只读 + 用户触发的冻结 `run_production_pipeline`，不接 LLM、不下单、不暴露参数修改/影子转正 |
+| Phase 4 | **薄工具层实现中（Schema v1.1 定稿 2026-09-22）**：`src/agent_tools.py` 注册 10 个只读工具 + 无参数 `run_production_pipeline()`（统一 envelope；只读工具不改 scores/ledger/snapshots、仅写 `logs/agent_audit/`；评分一律读快照内 CSV；月份查询固定选 score_generated_at 最新 + 全部候选 + 警告；T5 签名/白名单测试 11 项通过）；契约 `docs/PHASE4_AGENT_SCHEMA.md`、实测 `docs/PHASE4_FAILURE_SCENARIOS.md`、测试 `tests/test_agent_tools.py` |
 
 **研究目标（2026-09-18 重述）**：特征扩充的目的是**找到费用后稳定的组合增量**（相对全池），不是"让 ML 指标超过动量"；每组以费用后相对全池收益、回撤与分阶段表现评价，IC 仅作辅助；只在 dev 段内按时间滚动取舍。**清盘基金边界**：清盘历史池已部分并入（任务 3），但**并未消除**幸存者偏差——对外表述仍应为"现存 + 部分已清盘池的条件性历史研究"。**多重比较纪律（2026-09-19）**：第二组共试了 6 个相关方案、最高配对 NW 仅 +1.84，继续大量试规格会抬高偶然"最佳方案"的概率（数据窥探）——第三组已**预登记 4 个规格**（见任务 5 与 `ml/backtest/feature_group3_prereg.md`），非基线规格用 **Holm 校正**并报告总试验数。
 

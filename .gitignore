@@ -20,6 +20,8 @@ build/
 .coverage
 htmlcov/
 .mypy_cache/
+# Phase 4 薄工具层测试的临时 fixture（tests/test_agent_tools.py 创建）
+ml/_agt_test_*/
 
 # ===================== akshare下载缓存 / 临时文件 =====================
 *.tmp
