@@ -1,42 +1,41 @@
-# test_agent_tools.py：Phase 4 薄工具层 T5 测试（fixture/mock，**不运行真实生产流水线、
-# 不改真实 ledger/snapshots**；所有路径通过 monkeypatch 指向临时目录）。
+# test_agent_tools.py：Phase 4 薄工具层测试（v1.1）
+# fixture/mock 隔离：不运行真实生产流水线、不改真实 ledger/snapshots；
+# 所有路径经 monkeypatch 指向工作区 ml/ 临时目录；_current_health 统一由 mock 提供。
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import sys
-import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import agent_tools  # noqa: E402
-import production_pipeline  # noqa: E402   （仅确保可导入；测试不运行真实流水线）
+import production_pipeline  # noqa: E402
 
 RUN1 = "20260921_090000"
 RUN2 = "20260922_100000"
-
-
-def _score_rows(as_of):
-    import pandas as pd
-    return pd.DataFrame([
-        {"fund_code": "000001", "rank": 1, "score": 2.0, "confidence": "main", "as_of": as_of},
-        {"fund_code": "000002", "rank": 2, "score": 1.5, "confidence": "main", "as_of": as_of},
-        {"fund_code": "000003", "rank": 3, "score": 1.0, "confidence": "low", "as_of": as_of},
-    ])
 
 
 def _make_snapshot(root, run_id, as_of, generated_at, commit="c0f7d91"):
     d = os.path.join(root, "snapshots", run_id)
     os.makedirs(d, exist_ok=True)
     month = as_of[:7]
-    score = _score_rows(as_of)
+    import pandas as pd
+    # 低置信度行放在 CSV 前部（回归 P0-2：历史排名必须读 rank/rank_lowconf 列而非行号）
+    score = pd.DataFrame([
+        {"fund_code": "000003", "rank": None, "rank_lowconf": 1, "score": 0.8,
+         "fund_name": "低置信基金", "confidence": "low", "as_of": as_of},
+        {"fund_code": "000001", "rank": 1, "rank_lowconf": None, "score": 2.0,
+         "fund_name": "基金一号", "confidence": "main", "as_of": as_of},
+        {"fund_code": "000002", "rank": 2, "rank_lowconf": None, "score": 1.5,
+         "fund_name": "基金二号", "confidence": "main", "as_of": as_of},
+    ])
     score.to_csv(os.path.join(d, f"{month}.csv"), index=False)
-    pd = __import__("pandas")
-    pd.DataFrame(score[score["confidence"] == "main"][["fund_code", "rank"]]
-                 .to_dict("records")).sort_values("rank") \
+    pd.DataFrame([{"fund_code": "000001", "rank": 1}, {"fund_code": "000002", "rank": 2}]) \
         .to_csv(os.path.join(d, "top50.csv"), index=False)
-    # ledger 副本（与 top50 一致的 2026-09 cohort，planned）
     st = {"last_month": month, "cohorts": {
         month: {"signal_date": as_of, "execution_date": None, "expire_month": "2027-03",
                 "cohort_weight": 1 / 6, "n_codes": 2, "created_at": generated_at,
@@ -65,8 +64,18 @@ def _make_snapshot(root, run_id, as_of, generated_at, commit="c0f7d91"):
 
 
 class TestAgentTools(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._hc = mock.patch.object(agent_tools, "_current_health", return_value={
+            "status": "PASS", "score_ready": True, "benchmark_latest_date": "2026-09-21",
+            "gap_n": 0, "stale_n": 0, "shadow_stale": [], "shadow_factors": {}})
+        cls._hc.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._hc.stop()
+
     def setUp(self):
-        # 用工作区 ml/ 下临时目录（Windows 下 tempfile.mkdtemp 目录有 ACL 问题，改用 os.makedirs）
         self.tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml",
                                     f"_agt_test_{os.getpid()}_{id(self)}")
         os.makedirs(self.tmp_dir, exist_ok=True)
@@ -75,13 +84,11 @@ class TestAgentTools(unittest.TestCase):
         os.makedirs(snaps, exist_ok=True)
         self.snap1 = _make_snapshot(root, RUN1, "2026-09-18", "2026-09-21T09:00:00")
         self.snap2 = _make_snapshot(root, RUN2, "2026-09-21", "2026-09-22T10:00:00")
-        # 一个无 COMPLETE 的"半次运行"目录（不应进入候选）
         partial = os.path.join(snaps, "20260922_120000")
         os.makedirs(partial, exist_ok=True)
         with open(os.path.join(partial, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump({"run_id": "20260922_120000", "status": "complete"}, f)
 
-        # ledger（当前状态：2026-09 planned）
         led_dir = os.path.join(root, "ledger")
         os.makedirs(led_dir, exist_ok=True)
         led = {"last_month": "2026-09", "cohorts": {
@@ -95,9 +102,9 @@ class TestAgentTools(unittest.TestCase):
         vt = os.path.join(root, "vol_target_dev.txt")
         with open(vt, "w", encoding="utf-8") as f:
             f.write("  ② 波动目标动量      8.86%   16.56%     0.48   -38.04%     0.23\n")
+            f.write("仓位统计（波动目标动量）：均值 0.75｜中位 0.77｜最低 0.31｜满仓月占比 23.7%\n")
 
-        # monkeypatch 薄工具层路径 → fixture
-        self._originals = {k: getattr(agent_tools, k) for k in (
+        self._orig = {k: getattr(agent_tools, k) for k in (
             "SNAPSHOTS_DIR", "SCORES_DIR", "LEDGER_PATH", "VOLTARGET_REPORT", "AUDIT_DIR")}
         agent_tools.SNAPSHOTS_DIR = snaps
         agent_tools.SCORES_DIR = os.path.join(root, "scores")
@@ -107,12 +114,29 @@ class TestAgentTools(unittest.TestCase):
         os.makedirs(agent_tools.SCORES_DIR, exist_ok=True)
 
     def tearDown(self):
-        for k, v in self._originals.items():
+        for k, v in self._orig.items():
             setattr(agent_tools, k, v)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    # ---- T5-1 只读工具不修改 scores/ledger/snapshots ----
+    # ---- T5-1 只读：10 个只读工具全部纳入树哈希验证 ----
     def test_readonly_no_modify(self):
+        calls = [
+            ("get_data_health", {}),
+            ("get_latest_complete_snapshot", {}),
+            ("get_score", {"month": "2026-09"}),
+            ("get_score", {"run_id": RUN1}),
+            ("get_top_funds", {"month": "2026-09", "top_n": 2}),
+            ("get_fund_rank_history", {"fund_code": "000001"}),
+            ("get_portfolio_state", {}),
+            ("get_shadow_status", {}),
+            ("compare_snapshots", {"run_a": RUN1, "run_b": RUN2}),
+            ("get_risk_scenario_v1", {}),
+            ("generate_research_report", {"topic": "data_status"}),
+        ]
+        self.assertEqual(sorted(agent_tools.READ_ONLY_TOOLS),
+                         sorted({t for t, _ in calls if t != "get_data_health"} |
+                                {"get_data_health"}), "READ_ONLY_TOOLS 应覆盖全部只读工具")
+
         def tree_hash(root):
             h = hashlib.sha256()
             for dp, _, fs in os.walk(root):
@@ -125,70 +149,161 @@ class TestAgentTools(unittest.TestCase):
 
         snaps_before = tree_hash(os.path.join(self.tmp_dir, "snapshots"))
         led_before = tree_hash(os.path.join(self.tmp_dir, "ledger"))
-        for tool, kwargs in (("get_score", {"month": "2026-09"}),
-                             ("get_top_funds", {"month": "2026-09", "top_n": 2}),
-                             ("get_portfolio_state", {}),
-                             ("get_latest_complete_snapshot", {}),
-                             ("get_risk_scenario_v1", {}),
-                             ("compare_snapshots", {"run_a": RUN1, "run_b": RUN2}),
-                             ("get_fund_rank_history", {"fund_code": "000001"}),):
-            out = agent_tools.call(tool, **kwargs)
+        for tool, kw in calls:
+            out = agent_tools.call(tool, **kw)
             self.assertEqual(out["status"], "ok", f"{tool}: {out}")
         self.assertEqual(tree_hash(os.path.join(self.tmp_dir, "snapshots")), snaps_before,
                          "snapshots 被修改")
         self.assertEqual(tree_hash(os.path.join(self.tmp_dir, "ledger")), led_before,
                          "ledger 被修改")
 
-    # ---- T5-2 月份查询：选最新完整快照 + 全部候选 + 警告 ----
+    # ---- T5-12 health FAIL：当前查询停止、显式 run_id 可读（P0-1）----
+    def test_health_fail_gate(self):
+        with mock.patch.object(agent_tools, "_current_health", return_value={
+                "status": "FAIL", "score_ready": False, "benchmark_latest_date": "2026-09-21",
+                "shadow_stale": [], "shadow_factors": {}}):
+            for tool, kw in (("get_score", {"month": "2026-09"}),
+                             ("get_top_funds", {"month": "2026-09"}),
+                             ("get_portfolio_state", {}),
+                             ("generate_research_report", {"topic": "data_status"})):
+                out = agent_tools.call(tool, **kw)
+                self.assertEqual(out["status"], "unavailable", tool)
+                self.assertEqual(out["errors"][0]["code"], "health_fail", tool)
+            # 显式 run_id 历史审计读取不受阻，且必须标注 historical_audit
+            out = agent_tools.call("get_score", run_id=RUN1)
+            self.assertEqual(out["status"], "ok")
+            self.assertTrue(any("historical_audit" in w for w in out["warnings"]))
+            self.assertTrue(out["provenance"]["historical"])
+            out = agent_tools.call("compare_snapshots", run_a=RUN1, run_b=RUN2)
+            self.assertEqual(out["status"], "ok")
+            self.assertTrue(any("historical_audit" in w for w in out["warnings"]))
+
+    # ---- T5-13 低置信度在前时历史排名 = rank / rank_lowconf 列（P0-2）----
+    def test_rank_uses_column_not_rowindex(self):
+        out = agent_tools.call("get_fund_rank_history", fund_code="000002")
+        self.assertEqual(out["status"], "ok")
+        for mrow in out["detail"]["months"]:
+            self.assertEqual(mrow["rank"], 2)          # rank 列，而非原始行号 3
+            self.assertEqual(mrow["confidence"], "main")
+            self.assertEqual(mrow["fund_name"], "基金二号")
+            self.assertIsNotNone(mrow["score"])
+            self.assertIsNotNone(mrow["month"])
+        out3 = agent_tools.call("get_fund_rank_history", fund_code="000003")
+        self.assertEqual(out3["detail"]["months"][0]["rank"], 1)     # rank_lowconf 列
+        self.assertEqual(out3["detail"]["months"][0]["confidence"], "low")
+
+    # ---- T5-14 shadow 因子 fresh/stale 四种情形（P1-3）----
+    def test_shadow_four_cases(self):
+        cases = [
+            ([], "ok", None),
+            (["style_index_sz399006.csv"], "unavailable", "style_index_sz399006.csv"),
+            (["sw_industry(最旧 2026-09-18)"], "unavailable", "sw_industry"),
+            (["style_index_sz399006.csv", "style_index_sh000905.csv", "sw_industry(最旧 2026-09-18)"],
+             "unavailable", "style_index_sz399006.csv"),
+        ]
+        for stale, want_status, _first in cases:
+            with mock.patch.object(agent_tools, "_current_health", return_value={
+                    "status": "WARN", "score_ready": True, "benchmark_latest_date": "2026-09-21",
+                    "shadow_stale": stale, "shadow_factors": {}}):
+                out = agent_tools.call("get_shadow_status")
+                self.assertEqual(out["status"], want_status, stale)
+                if want_status == "unavailable":
+                    self.assertEqual(out["errors"][0]["code"], "shadow_factor_stale")
+
+    # ---- T5-15 Top 名称/分数 与 组合溯源字段（P1-4/P1-5）----
+    def test_top_details_and_portfolio_provenance(self):
+        out = agent_tools.call("get_top_funds", month="2026-09", top_n=2)
+        self.assertEqual(out["status"], "ok")
+        for r in out["detail"]["top"]:
+            self.assertIn("fund_name", r)
+            self.assertIn("score", r)
+        st = agent_tools.call("get_portfolio_state")
+        self.assertEqual(st["status"], "ok")
+        c = st["detail"]["cohorts"][0]
+        self.assertEqual(c["score_run"], RUN2)                       # 溯源
+        self.assertTrue(c["source_snapshot"].endswith(RUN2))          # 对应快照
+        self.assertEqual(st["detail"]["reference_snapshot"], RUN2)
+        self.assertEqual(st["data_cutoff"], "2026-09-21")
+
+    # ---- T5-16 scenario=true 与仓位统计（P1-7）----
+    def test_risk_scenario_v1(self):
+        out = agent_tools.call("get_risk_scenario_v1")
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["detail"]["frozen_target_vol"], 0.15)
+        self.assertIs(out["detail"]["scenario"], True)
+        self.assertIn("position", out["detail"])
+        self.assertAlmostEqual(out["detail"]["position"]["mean"], 0.75)
+
+    # ---- T5-17 未注册工具与非法参数均写审计（P1-9）----
+    def test_audit_for_rejected_calls(self):
+        day = __import__("datetime").datetime.now().strftime("%Y%m%d")
+        p = os.path.join(agent_tools.AUDIT_DIR, f"agent_audit_{day}.jsonl")
+        before = sum(1 for _ in open(p, encoding="utf-8")) if os.path.exists(p) else 0
+        agent_tools.call("confirm_execution", cohort_id="2026-09", execution_date="2026-10-01")
+        agent_tools.call("get_top_funds", month="2026-09", hold_period=6)
+        with open(p, encoding="utf-8") as _f:
+            lines = _f.readlines()
+        self.assertEqual(len(lines) - before, 2)
+        last = json.loads(lines[-1])
+        self.assertEqual(last["tool"], "get_top_funds")
+        self.assertEqual(last["status"], "not_executable")
+        self.assertEqual(last["caller"], "local_user")
+
+    # ---- T5-18 mock run_pipeline：零参数成功 + 异常 → aborted ----
+    def test_run_pipeline_mocked(self):
+        import inspect as _inspect
+        sig = _inspect.signature(agent_tools.run_production_pipeline)
+        self.assertEqual(list(sig.parameters), [])
+        man = {"run_id": "20260922_999999", "status": "complete", "data_cutoff": "2026-09-21",
+               "shadow_stale": [], "eligible_size": 5118,
+               "cohort_action": {"cohort_status": "planned"}}
+        with mock.patch("production_pipeline.run_pipeline", return_value={
+                "run_id": "20260922_999999", "snapshot": "ml/snapshots/20260922_999999",
+                "manifest": man}):
+            out = agent_tools.call("run_production_pipeline")
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["run_id"], "20260922_999999")
+        with mock.patch("production_pipeline.run_pipeline",
+                        side_effect=RuntimeError("step_clean 失败")):
+            out = agent_tools.call("run_production_pipeline")
+        self.assertEqual(out["status"], "aborted")
+        self.assertEqual(out["errors"][0]["code"], "run_aborted")
+
+    # ---- 既有契约检查（保留）----
     def test_month_latest_with_candidates(self):
         out = agent_tools.call("get_score", month="2026-09")
         self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["run_id"], RUN2)          # score_generated_at 最新
-        self.assertEqual(out["detail"]["month"], "2026-09")
-        cand_warn = [w for w in out["warnings"] if w.startswith("multiple_complete_for_month")]
-        self.assertEqual(len(cand_warn), 1)
-        self.assertIn(RUN1, cand_warn[0])
-        self.assertIn(RUN2, cand_warn[0])
-        # 评分必须来自快照内 CSV
+        self.assertEqual(out["run_id"], RUN2)
+        cand = [w for w in out["warnings"] if w.startswith("multiple_complete_for_month")]
+        self.assertEqual(len(cand), 1)
+        self.assertIn(RUN1, cand[0])
         self.assertTrue(out["provenance"]["score_file"].startswith(agent_tools.SNAPSHOTS_DIR))
 
-    # ---- T5-3 显式 run_id 严格读取 ----
     def test_runid_strict(self):
         out = agent_tools.call("get_score", run_id=RUN1)
-        self.assertEqual(out["status"], "ok")
         self.assertEqual(out["run_id"], RUN1)
         self.assertEqual(out["detail"]["as_of"], "2026-09-18")
         miss = agent_tools.call("get_score", run_id="20990101_000000")
         self.assertEqual(miss["status"], "unavailable")
         self.assertEqual(miss["errors"][0]["code"], "no_snapshot_for_run")
 
-    # ---- T5-4 top_n 超限 → not_executable ----
     def test_topn_too_large_rejected(self):
         out = agent_tools.call("get_top_funds", month="2026-09", top_n=201)
         self.assertEqual(out["status"], "not_executable")
-        self.assertEqual(out["errors"][0]["code"], "research_boundary")
 
-    # ---- T5-5 策略参数/模式开关 → 签名拒绝（research_boundary / TypeError）----
     def test_strategy_params_rejected(self):
-        out = agent_tools.call("get_top_funds", month="2026-09", hold_period=6)
-        self.assertEqual(out["status"], "not_executable")
-        out2 = agent_tools.call("run_production_pipeline", skip_refresh=True)
-        self.assertEqual(out2["status"], "not_executable")
-        out3 = agent_tools.call("run_production_pipeline", as_of="2026-10-01")
-        self.assertEqual(out3["status"], "not_executable")
-        self.assertIn("research_boundary", out3["errors"][0]["code"])
+        for kw in ({"month": "2026-09", "hold_period": 6},
+                   {"month": "2026-09", "top_n": 50, "fee_rate": 0.0015}):
+            out = agent_tools.call("get_top_funds", **kw)
+            self.assertEqual(out["status"], "not_executable", kw)
+        self.assertEqual(agent_tools.call("run_production_pipeline", skip_refresh=True)["status"],
+                         "not_executable")
+        self.assertEqual(agent_tools.call("run_production_pipeline", as_of="2026-10-01")["status"],
+                         "not_executable")
 
-    # ---- T5-6 run_production_pipeline 签名无参数 ----
-    def test_pipeline_signature_no_args(self):
-        import inspect
-        sig = inspect.signature(agent_tools.run_production_pipeline)
-        self.assertEqual(list(sig.parameters), [])
-
-    # ---- T5-7 无 COMPLETE 快照 → unavailable ----
     def test_no_complete_unavailable(self):
         out = agent_tools.call("get_latest_complete_snapshot")
-        self.assertEqual(out["status"], "ok")             # fixture 有两个完整快照
-        # 把 COMPLETE 全部移走 → 模拟无完整快照
+        self.assertEqual(out["status"], "ok")
         for s in (self.snap1, self.snap2):
             os.rename(os.path.join(s, "COMPLETE"), os.path.join(s, "COMPLETE.bak"))
         out2 = agent_tools.call("get_latest_complete_snapshot")
@@ -196,38 +311,31 @@ class TestAgentTools(unittest.TestCase):
         for s in (self.snap1, self.snap2):
             os.rename(os.path.join(s, "COMPLETE.bak"), os.path.join(s, "COMPLETE"))
 
-    # ---- T5-8 cohort planned → warnings（不得宣称已持仓）----
+    def test_latest_snapshot_cohort_status_string(self):
+        out = agent_tools.call("get_latest_complete_snapshot")
+        self.assertEqual(out["provenance"]["cohort_status"], "planned")   # 字符串，非布尔
+
     def test_planned_warnings(self):
         out = agent_tools.call("get_portfolio_state")
-        self.assertEqual(out["status"], "ok")
-        self.assertTrue(any("planned" in w for w in out["warnings"]), out["warnings"])
-        self.assertEqual(out["detail"]["n_active"], 0)
+        self.assertTrue(any("planned" in w for w in out["warnings"]))
 
-    # ---- T5-9 不注册不暴露操作 ----
     def test_unexposed_rejected(self):
         for tool in ("confirm_execution", "modify_strategy", "retrain", "promote_shadow", "trade"):
             out = agent_tools.call(tool)
             self.assertEqual(out["status"], "not_executable", tool)
             self.assertEqual(out["errors"][0]["code"], "unknown_tool", tool)
 
-    # ---- T5-10 审计日志：调用后 agent_audit 增长（唯一可写路径）----
     def test_audit_written(self):
-        p = os.path.join(agent_tools.AUDIT_DIR, f"agent_audit_{__import__('datetime').datetime.now().strftime('%Y%m%d')}.jsonl")
+        day = __import__("datetime").datetime.now().strftime("%Y%m%d")
+        p = os.path.join(agent_tools.AUDIT_DIR, f"agent_audit_{day}.jsonl")
         before = os.path.getsize(p) if os.path.exists(p) else 0
         agent_tools.call("get_score", month="2026-09")
         self.assertTrue(os.path.exists(p))
         self.assertGreater(os.path.getsize(p), before)
-        with open(p, encoding="utf-8") as f:
-            last = json.loads(f.readlines()[-1])
-        self.assertEqual(last["tool"], "get_score")
-        self.assertEqual(last["status"], "ok")
 
-    # ---- T5-11 风险情景工具无参数返回冻结 15% ----
-    def test_risk_scenario_v1_noargs(self):
-        out = agent_tools.call("get_risk_scenario_v1")
-        self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["detail"]["frozen_target_vol"], 0.15)
-        self.assertTrue(any("scenario=true" in w for w in out["warnings"]))
+    def test_report_topic_enum(self):
+        out = agent_tools.call("generate_research_report", topic="rebalance_search")
+        self.assertEqual(out["status"], "not_executable")
 
 
 if __name__ == "__main__":

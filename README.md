@@ -643,7 +643,7 @@ Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/
 | 风险控制 v1 | **风险目标达成，但策略转正门槛未全部通过**（保留为情景分析工具） |
 | Shadow strategies | **forward observation 中**（2026-09 起，标签 2027-03 后成熟） |
 | **Phase 3.5** | **完成（2026-09-21 验收通过）**：生产流水线/健康检查/组合 ledger/不可变快照；正式快照 `20260921_104949`（status=complete、SHA 可复现） |
-| Phase 4 | **薄工具层实现中（Schema v1.1 定稿 2026-09-22）**：`src/agent_tools.py` 注册 10 个只读工具 + 无参数 `run_production_pipeline()`（统一 envelope；只读工具不改 scores/ledger/snapshots、仅写 `logs/agent_audit/`；评分一律读快照内 CSV；月份查询固定选 score_generated_at 最新 + 全部候选 + 警告；T5 签名/白名单测试 11 项通过）；契约 `docs/PHASE4_AGENT_SCHEMA.md`、实测 `docs/PHASE4_FAILURE_SCENARIOS.md`、测试 `tests/test_agent_tools.py` |
+| Phase 4 | **薄工具层实现完成（v1.1，2026-09-22）**：`src/agent_tools.py` 注册 10 个只读工具 + 无参数 `run_production_pipeline()`（统一 envelope；只读工具不改 scores/ledger/snapshots、仅写 `logs/agent_audit/`；评分一律读快照内 CSV；月份查询固定选 score_generated_at 最新 + 全部候选 + 警告；**当前查询 health FAIL 门禁**、显式 run_id 历史审计标注、历史排名读 rank/rank_lowconf 列、审计含 caller 且拒绝请求亦记录）；契约 `docs/PHASE4_AGENT_SCHEMA.md`、失败场景 `docs/PHASE4_FAILURE_SCENARIOS.md`（6 项全覆盖）、测试 `tests/test_agent_tools.py`（18 项通过）；暂缓对话/LLM 层，先人工只读验收 |
 
 **研究目标（2026-09-18 重述）**：特征扩充的目的是**找到费用后稳定的组合增量**（相对全池），不是"让 ML 指标超过动量"；每组以费用后相对全池收益、回撤与分阶段表现评价，IC 仅作辅助；只在 dev 段内按时间滚动取舍。**清盘基金边界**：清盘历史池已部分并入（任务 3），但**并未消除**幸存者偏差——对外表述仍应为"现存 + 部分已清盘池的条件性历史研究"。**多重比较纪律（2026-09-19）**：第二组共试了 6 个相关方案、最高配对 NW 仅 +1.84，继续大量试规格会抬高偶然"最佳方案"的概率（数据窥探）——第三组已**预登记 4 个规格**（见任务 5 与 `ml/backtest/feature_group3_prereg.md`），非基线规格用 **Holm 校正**并报告总试验数。
 

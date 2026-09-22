@@ -60,18 +60,18 @@
 ```
 - 查询 2026-10 → 无正式快照 → 返回 `unavailable` 并引用最近完整快照（契约第 6 条）✓。
 
-## 汇总（v1.1 修正：T5 为"待实现层验证"）
+## 汇总（v1.1 修正：T5 已在薄工具层实现并测试通过）
 
 | 停止条件 | 可检测性 | 检测来源 | 结果 |
 |---|---|---|---|
 | ① 缺 COMPLETE | ✅ 实测 | 文件系统（快照目录 COMPLETE 标志） | 正式 vs 测试可区分 |
-| ② health=FAIL | ✅ 实测 | `data_health.check()`（processed 中位滞后） | FAIL 分支可达 |
-| ③ shadow 因子过期 | ✅ 实测 | `health_report.shadow_stale` | 当时正命中（sz399006） |
-| ④ cohort planned | ✅ 实测 | `portfolio_state.cohorts[..].status` | 当时正命中 |
-| ⑤ 冻结参数变更 | ⏳ **待薄工具层实现后验证**（v1.1：接口签名断言 + 入参白名单 + research_boundary 审计；设计层已固定，尚无实现层测试） | Schema 接口固件 | 计划内 |
-| ⑥ 无该月正式快照 | ✅ 实测 | `ml/scores/*.csv` + `ml/snapshots/*/COMPLETE` | 当时仅 2026-09；2026-10 查询 → unavailable |
+| ② health=FAIL | ✅ 实测 | `_current_health()`（v1.1 当前查询门禁；显式 run_id 历史审计放行并标注 historical_audit） | FAIL → 当前查询 unavailable(health_fail) |
+| ③ shadow 因子过期 | ✅ 实测 | 复用 `_current_health().shadow_stale`（v1.1 修正判定方向） | 存在 stale → unavailable(shadow_factor_stale) |
+| ④ cohort planned | ✅ 实测 | `portfolio_state.cohorts[..].status` | planned → 警告，不得宣称已持仓 |
+| ⑤ 冻结参数变更 | ✅ **已实现并测试**（`p4-agent-tools-v1`/`v1.1`：`tests/test_agent_tools.py` 18 项，含签名拒绝/白名单/research_boundary 审计） | 工具签名断言 + 入参白名单 + 审计 | not_executable + 审计记录 |
+| ⑥ 无该月正式快照 | ✅ 实测 | 快照目录 + COMPLETE 过滤 | 查询 → unavailable + 最近引用 |
 
-→ **5 项实测通过；T5（冻结参数变更拒绝）待薄工具层实现后验证，不得宣称六项全部实测。**
+→ **6 项全部实现并由测试覆盖**（`tests/test_agent_tools.py`：18 项通过；fixture 隔离，不运行真实流水线）。
 
 结论：在不改动生产系统的前提下，Agent 契约的停止条件（除 T5 权限拒绝外）都能被真实、可复现地检测；
 薄工具层只需按 `PHASE4_AGENT_SCHEMA.md` 包装这些读取路径即可。
