@@ -1,0 +1,47 @@
+{
+  "generated_at": "2026-09-22T10:13:26",
+  "benchmark_latest": "2026-09-21 00:00:00",
+  "benchmark_latest_date": "2026-09-21",
+  "raw_latest": "2026-09-21 00:00:00",
+  "raw_latest_date": "2026-09-21",
+  "raw_funds": 11418,
+  "processed_dist": {
+    "median": "2026-09-21",
+    "p25": "2026-09-21",
+    "min": "2026-09-17",
+    "max": "2026-09-21",
+    "n_funds": 5317,
+    "n_at_max": 5315,
+    "n_behind_max_gt1d": 2
+  },
+  "processed_latest_date": "2026-09-21",
+  "processed_funds": 5317,
+  "stale_n": 0,
+  "gap_n": 1,
+  "gap_scope": "alive 现存池，交易日口径（gap=落后≥2交易日）",
+  "catchup": "见最近 pipeline manifest（data_health 独立运行不拉取）",
+  "shadow_factors": {
+    "style_index_sh000905.csv": "2026-09-18 00:00:00",
+    "style_index_sz399006.csv": "2026-09-17 00:00:00",
+    "sw_industry": {
+      "n_files": 31,
+      "min_date": "2026-09-18",
+      "max_date": "2026-09-18",
+      "behind_max": []
+    }
+  },
+  "last_scores": {
+    "file": "2026-09.csv",
+    "as_of": "2026-09-18",
+    "total": 5118,
+    "main": 4901,
+    "low": 217
+  },
+  "shadow_stale": [
+    "style_index_sh000905.csv",
+    "style_index_sz399006.csv",
+    "sw_industry(最旧 2026-09-18)"
+  ],
+  "status": "WARN",
+  "score_ready": true
+}

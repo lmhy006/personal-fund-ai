@@ -86,17 +86,26 @@ class LivePortfolio:
 
     # ---------------- 月度动作 ----------------
     def add_month(self, scores_df: pd.DataFrame, top_n: int = TOP_N,
-                  cohort_weight: float = COHORT_WEIGHT) -> dict:
-        """用本月评分快照推进一个月：识别新增/到期 cohort，写入 ledger 与 state。
+                  cohort_weight: float = COHORT_WEIGHT,
+                  score_run: str | None = None) -> dict:
+        """用本月评分快照推进一个月：识别新增/更新/到期 cohort，写入 ledger 与 state。
 
-        :return: 本月动作摘要（新增/到期/费用），若该月已存在则返回 {'skipped': True}。
+        同月重复正式运行（v1.1 边界修正）：
+          - cohort **已成交（active/expired）** → 幂等跳过（锁定）；
+          - cohort 仍为 **planned**（未成交）→ 用最新正式评分**更新选股**（signal_date / score_run 前进），
+            保证"同月数据更新后，未执行的计划反映最新信号"；confirm_execution 后即锁定。
+
+        :param score_run: 来源 run_id（如 ml/snapshots/20260922_100411），供 ledger 溯源。
+        :return: 本月动作摘要（new/updated/skipped + 到期/费用）。
         """
         if "as_of" not in scores_df.columns or not len(scores_df):
             raise ValueError("scores_df 缺少 as_of 或为空")
         asof = pd.Timestamp(scores_df["as_of"].iloc[0])
         month_key = asof.strftime("%Y-%m")
-        if month_key in self.state["cohorts"]:
-            return {"skipped": True, "month": month_key}
+        cur_status = self.state["cohorts"][month_key].get("status") if month_key in self.state["cohorts"] else None
+        if cur_status in ("active", "expired"):
+            return {"skipped": True, "month": month_key, "reason": f"cohort {month_key} 已{cur_status}（锁定）"}
+        renewed = cur_status == "planned"        # 同月第二次正式评分 → 更新未执行的计划
 
         main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df else scores_df
         top = main.sort_values("rank").head(top_n) if "rank" in main.columns else \
@@ -110,6 +119,7 @@ class LivePortfolio:
         exec_date = next_trading_day_after(asof)
         exec_date_str = exec_date.strftime("%Y-%m-%d") if exec_date is not None else None
         expire_month = month_add(month_key, HOLD)
+        now = datetime.now().isoformat(timespec="seconds")
 
         # 到期：expire_month == 本月的 **active** cohort 标记 expired
         expired_now = []
@@ -120,15 +130,42 @@ class LivePortfolio:
                 self.ledger.loc[self.ledger["cohort_id"] == cid, "status"] = "expired"
                 expired_now.append(cid)
 
+        # 同月 planned 更新：替换选股（保留 cohort_id；expire/权重不变）
+        if renewed:
+            cid = month_key
+            meta = self.state["cohorts"][cid]
+            meta.update({
+                "signal_date": signal_date, "execution_date": exec_date_str,
+                "n_codes": len(codes), "updated_at": now,
+            })
+            if score_run:
+                meta["score_run"] = score_run          # 溯源：选股来自哪个正式 run
+            self.ledger = self.ledger[self.ledger["cohort_id"] != cid]   # 移除旧选股
+            new_rows = pd.DataFrame([{
+                "cohort_id": cid, "fund_code": c, "weight_in_cohort": cohort_weight / len(codes),
+                "signal_date": signal_date, "execution_date": exec_date_str,
+                "created_at": meta.get("created_at", now), "expire_month": expire_month,
+                "status": meta["status"]} for c in codes])
+            self.ledger = pd.concat([self.ledger, new_rows], ignore_index=True)
+            self.save()
+            act = self.aggregate()
+            return {"status": "updated", "month": month_key, "signal_date": signal_date,
+                    "execution_date": exec_date_str, "cohort_status": meta["status"],
+                    "new_codes": len(codes), "expired_cohorts": sorted(expired_now),
+                    "score_run": score_run, "cash_weight": act["cash_weight"],
+                    "n_active_cohorts": act["n_active"]}
+
         # 新增：无已确认成交日 → status="planned"（不参与风险权重，现金仍持有）；
         # 成交日确认后由 confirm_execution 更新为 "active"
         cid = month_key
         self.state["cohorts"][cid] = {
             "signal_date": signal_date, "execution_date": exec_date_str,
             "expire_month": expire_month, "cohort_weight": cohort_weight,
-            "n_codes": len(codes), "created_at": datetime.now().isoformat(timespec="seconds"),
+            "n_codes": len(codes), "created_at": now,
             "status": "active" if exec_date is not None else "planned",
         }
+        if score_run:
+            self.state["cohorts"][cid]["score_run"] = score_run
         new_rows = pd.DataFrame([{
             "cohort_id": cid, "fund_code": c, "weight_in_cohort": cohort_weight / len(codes),
             "signal_date": signal_date, "execution_date": exec_date_str,

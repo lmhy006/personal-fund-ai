@@ -1,15 +1,13 @@
 {
   "cohorts": {
     "2026-09": {
-      "signal_date": "2026-09-21",
+      "signal_date": "2026-09-18",
       "execution_date": null,
       "expire_month": "2027-03",
       "cohort_weight": 0.16666666666666666,
       "n_codes": 50,
       "created_at": "2026-09-21T10:54:26",
-      "status": "planned",
-      "updated_at": "2026-09-22T10:15:32",
-      "score_run": "20260922_100411"
+      "status": "planned"
     }
   },
   "last_month": "2026-09",
