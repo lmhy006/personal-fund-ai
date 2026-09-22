@@ -198,7 +198,7 @@ def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp):
 
 
 def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
-                  pf, action, agg, top50):
+                  pf, action, agg, top50, test_mode: bool = False):
     log("步骤8/8 不可变 snapshot…")
     snap = os.path.join(SNAPSHOTS_DIR, run_id)
     os.makedirs(snap, exist_ok=True)
@@ -216,6 +216,17 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
     manifest["portfolio"] = agg
     manifest["cohort_action"] = action
     manifest["top50"] = top50["fund_code"].tolist()
+    # 测试模式（含 skip 开关的诊断/重试运行）不得写 COMPLETE（v1.1 用户审查）：
+    #   正式 forward 记录必须来自完整流程
+    if test_mode:
+        manifest["status"] = "test"
+        with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
+        with open(os.path.join(snap, "NOT_COMPLETE_TEST"), "w", encoding="utf-8") as f:
+            f.write(f"{manifest['run_id']} test_run_at={manifest['score_generated_at']}\n"
+                    f"原因：本次运行含 skip 开关（诊断/重试），非正式 forward 记录\n")
+        log(f"  ⚠️ snapshot 已写入 {snap}（**NOT_COMPLETE_TEST**：含 skip 开关，非正式记录）")
+        return snap
     manifest["status"] = "complete"      # 只有全部步骤成功、快照落盘后才置 complete
     with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
@@ -281,10 +292,13 @@ def main():
                                    "planned/pending，成交日确认后才 active，见 live_portfolio 的 "
                                    "confirm_execution）",
         }
-        snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50)
+        snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
+                             test_mode=bool(args.skip_refresh or args.skip_clean))
         with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
             f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
-        log("✅ 流水线完成；正式评分与快照已生成")
+        log("✅ 流水线完成；正式评分与快照已生成"
+            if manifest["status"] == "complete" else
+            "⚠️ 流水线完成，但本次为**测试运行**（含 skip 开关），快照已标 NOT_COMPLETE_TEST，非正式记录")
         log(f"  下一步：Agent 可读取 {snap}/manifest.json 复原'当时系统看见了什么'")
     except Exception as e:  # noqa: BLE001
         log(f"❌ 流水线中止：{e}")

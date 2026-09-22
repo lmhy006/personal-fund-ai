@@ -60,16 +60,18 @@
 ```
 - 查询 2026-10 → 无正式快照 → 返回 `unavailable` 并引用最近完整快照（契约第 6 条）✓。
 
-## 汇总
+## 汇总（v1.1 修正：T5 为"待实现层验证"）
 
 | 停止条件 | 可检测性 | 检测来源 | 结果 |
 |---|---|---|---|
-| ① 缺 COMPLETE | ✅ | 文件系统（快照目录 COMPLETE 标志） | 正式 vs 测试可区分 |
-| ② health=FAIL | ✅ | `data_health.check()`（processed 中位滞后） | FAIL 分支可达 |
-| ③ shadow 因子过期 | ✅ | `health_report.shadow_stale` | 当前正命中（sz399006） |
-| ④ cohort planned | ✅ | `portfolio_state.cohorts[..].status` | 当前正命中 |
-| ⑤ 冻结参数变更 | ✅（设计层） | Schema 接口固件 + 实现层签名/白名单双锁 | 计划内 |
-| ⑥ 无该月正式快照 | ✅ | `ml/scores/*.csv` + `ml/snapshots/*/COMPLETE` | 当前仅 2026-09；2026-10 查询 → unavailable |
+| ① 缺 COMPLETE | ✅ 实测 | 文件系统（快照目录 COMPLETE 标志） | 正式 vs 测试可区分 |
+| ② health=FAIL | ✅ 实测 | `data_health.check()`（processed 中位滞后） | FAIL 分支可达 |
+| ③ shadow 因子过期 | ✅ 实测 | `health_report.shadow_stale` | 当时正命中（sz399006） |
+| ④ cohort planned | ✅ 实测 | `portfolio_state.cohorts[..].status` | 当时正命中 |
+| ⑤ 冻结参数变更 | ⏳ **待薄工具层实现后验证**（v1.1：接口签名断言 + 入参白名单 + research_boundary 审计；设计层已固定，尚无实现层测试） | Schema 接口固件 | 计划内 |
+| ⑥ 无该月正式快照 | ✅ 实测 | `ml/scores/*.csv` + `ml/snapshots/*/COMPLETE` | 当时仅 2026-09；2026-10 查询 → unavailable |
 
-结论：**在不改动生产系统的前提下，Agent 契约的所有停止条件都能被真实、可复现地检测**；
+→ **5 项实测通过；T5（冻结参数变更拒绝）待薄工具层实现后验证，不得宣称六项全部实测。**
+
+结论：在不改动生产系统的前提下，Agent 契约的停止条件（除 T5 权限拒绝外）都能被真实、可复现地检测；
 薄工具层只需按 `PHASE4_AGENT_SCHEMA.md` 包装这些读取路径即可。
