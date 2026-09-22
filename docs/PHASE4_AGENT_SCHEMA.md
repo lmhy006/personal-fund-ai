@@ -8,7 +8,7 @@
 > 1. `run_risk_scenario(target_vol)` → **`get_risk_scenario_v1()`（无参数）**——只读已冻结的 15% 结果，不提供参数搜索路径；
 > 2. `run_production_pipeline()` **对 Agent 不接受任何参数**；`skip_refresh`/`skip_clean` 只留在 CLI（诊断/重试），用它们生成的运行**不写 COMPLETE**（写 test marker、manifest status=test）；
 > 3. 状态枚举**加入 `aborted`**：`ok | unavailable | aborted | error | not_executable`；所有示例强制包含全部统一字段（允许 `null`）；
-> 4. **`run_id` 是权威快照键**，`month` 仅为便利查询；同月多个完整快照返回候选列表或选 `score_generated_at` 最新并附警告；评分必须读 **snapshot 内 CSV**，不读会被覆盖的 `ml/scores/YYYY-MM.csv`；
+> 4. **`run_id` 是权威快照键**，`month` 仅为便利查询；同月多个完整快照**始终选择 `score_generated_at` 最新者**并返回**全部候选 `run_id`** 与 `multiple_complete_for_month` 警告（不提供"或列表或最新"的二义行为）；显式传入 `run_id` 时**严格读取指定快照**；评分必须读 **snapshot 内 CSV**，不读会被覆盖的 `ml/scores/YYYY-MM.csv`；
 > 5. `data_health=FAIL` 阻止**新生产运行与"当前最新"结论**，但**不阻止读取历史完整快照**（系统故障时仍可审计历史）；
 > 6. 审计日志允许写入独立路径，但**不得修改 scores / ledger / snapshots**。
 
@@ -28,7 +28,7 @@
 |---|---|---|---|
 | `get_data_health` | 最近一次数据健康报告 | — | status(PASS/WARN/FAIL)、score_ready、shadow_stale、processed 分布、gap/stale |
 | `get_latest_complete_snapshot` | 最近一份带 `COMPLETE` 的正式快照 | — | run_id、manifest 摘要、评分文件哈希 |
-| `get_score` | 指定月分的正式评分（**run_id 权威，month 便利**） | `run_id`（权威）或 `month`（YYYY-MM，可空） | scores 行数、main/low 计数、as_of、**snapshot 内** CSV 路径 |
+| `get_score` | 指定（run_id 权威 / month 便利）的正式评分 | `run_id`（权威）或 `month`（YYYY-MM，可空） | scores 行数、main/low 计数、as_of、**snapshot 内** CSV 路径；同月多完整快照 → 最新 + 全部候选 run_id + 警告 |
 | `get_top_funds` | 某次正式评分的 TopN（**仅查询展示**） | `run_id` 或 `month`、`top_n`(≤200) | 主策略 TopN 代码/名称/分数/排名 |
 | `get_fund_rank_history` | 某基金在历次正式评分中的排名与分数 | `fund_code` | 各月 rank/score/是否 Top50；无历史月份则明示可用范围 |
 | `get_portfolio_state` | 当前 6-cohort ledger 聚合 | — | active cohorts、聚合权重、现金、**planned 列表**、预计费用 |
@@ -160,8 +160,8 @@
 失败（无该月）：`{"status":"unavailable","run_id":null,"data_cutoff":null,"strategy_version":"momentum-v1",
 "source_snapshot":null,"warnings":["最近完整快照：20260921_104949"],
 "errors":[{"code":"no_snapshot_for_month","message":"未找到 2026-10 的正式快照"}],"provenance":null}`
-同月多个完整快照：返回候选列表要求指定，或取 `score_generated_at` 最新者并附警告
-`"warnings":["multiple_complete_for_month：2026-09 存在 2 个完整快照，已取 score_generated_at 最新"]`。
+同月多个完整快照：**固定规则（v1.1 收口）**——始终选择 `score_generated_at` 最新者，并在 `warnings` 返回**全部候选 `run_id`**；显式传入 `run_id` 时严格读取指定快照（不适用自动选择）：
+`"warnings":["multiple_complete_for_month：2026-09 存在 2 个完整快照（20260921_104949, 20260922_100411），已取 score_generated_at 最新（20260922_100411）"]`。
 
 ### get_top_funds(run_id | month, top_n)
 ```json

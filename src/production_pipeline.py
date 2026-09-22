@@ -186,11 +186,13 @@ def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
     return path, None
 
 
-def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp):
-    log("步骤7/8 live_portfolio（6-cohort ledger，方案 A 逐步建仓）…")
+def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str):
+    log(f"步骤7/8 live_portfolio（6-cohort ledger，方案 A 逐步建仓；score_run={run_id}）…")
     from live_portfolio import LivePortfolio
     pf = LivePortfolio()
-    action = pf.add_month(scores_df)
+    # P0 修复（2026-09-22 用户审查）：正式调用必须传入本次 run_id 作为 score_run，
+    # 使组合台账可追溯到权威 run_id（同月 planned 更新时不会保留旧来源）
+    action = pf.add_month(scores_df, score_run=run_id)
     agg = pf.aggregate()
     log(f"  本月动作：{json.dumps(action, ensure_ascii=False)}")
     log(f"  当前：{json.dumps({k: agg[k] for k in ('n_active', 'cash_weight', 'n_funds')}, ensure_ascii=False)}")
@@ -266,7 +268,7 @@ def main():
         scores_df, t_date, scores_path, score_meta = step_live_score(as_of)
         data_cutoff = t_date
         shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
-        pf, action, agg = step_portfolio(scores_df, t_date)
+        pf, action, agg = step_portfolio(scores_df, t_date, run_id)
 
         main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
         top50 = main.sort_values("rank").head(TOP_N) if "rank" in main.columns else \
