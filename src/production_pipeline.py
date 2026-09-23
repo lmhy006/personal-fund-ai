@@ -371,9 +371,13 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
                          mode=snapshot_mode, shadow_factor_refresh=factor_refresh)
     with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
         f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
-    log("✅ 流水线完成；正式评分与快照已生成"
-        if manifest["status"] == "complete" else
-        "⚠️ 流水线完成，但本次为**测试运行**（含 skip 开关），快照已标 NOT_COMPLETE_TEST，非正式记录")
+    if manifest["status"] == "complete":
+        log("✅ 流水线完成；月末正式评分与快照已生成（COMPLETE）")
+    elif manifest["status"] == "observation":
+        log("👁️ 流水线完成（**月中观察运行**）：数据/评分/影子已更新并留 observation 快照，"
+            "正式 cohort 未推进（月末信号规则）")
+    else:
+        log("⚠️ 流水线完成，但本次为**测试运行**（含 skip 开关），快照已标 NOT_COMPLETE_TEST，非正式记录")
     log(f"  下一步：Agent 可读取 {snap}/manifest.json 复原'当时系统看见了什么'")
     return {"run_id": run_id, "snapshot": snap, "manifest": manifest,
             "status": manifest["status"]}

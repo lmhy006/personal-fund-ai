@@ -17,6 +17,7 @@ import os
 import time
 
 import akshare as ak
+import numpy as np
 import pandas as pd
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +51,14 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
     print(f"当日接口：{len(daily)} 只基金 | 覆盖交易日 {dates} | 请求耗时 {time.time() - t0:.1f}s")
 
     codes = pd.read_csv(pool, dtype={"基金代码": str})["基金代码"].astype(str).tolist()
-    stat = {"updated": 0, "uptodate": 0, "gap": 0, "nocache": 0, "nodata": 0}
+    stat = {"updated": 0, "uptodate": 0, "gap": 0, "nocache": 0, "nodata": 0, "filled_prev": 0}
     gap_list = []
+    # 基准交易日历（缝隙区判定用：avail 与缓存末日期是否**相邻交易日**）
+    bench_ns = None
+    _bp = os.path.join(RAW_DIR, "benchmark_hs300.csv")
+    if os.path.exists(_bp):
+        bench_ns = pd.to_datetime(pd.read_csv(_bp, parse_dates=["date"])["date"]) \
+            .to_numpy("datetime64[ns]")
     for code in codes:
         path = os.path.join(NAV_DIR, f"fund_{code}.csv")
         if not os.path.exists(path):
@@ -61,10 +68,6 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
             stat["nodata"] += 1
             continue
         row = daily.loc[code]
-        nav_new = row.get(f"{latest}-单位净值")
-        if pd.isna(nav_new):
-            stat["nodata"] += 1
-            continue
         cache = pd.read_csv(path, parse_dates=["date"])
         if not len(cache):
             stat["nocache"] += 1
@@ -73,22 +76,39 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
         if last >= pd.Timestamp(latest):
             stat["uptodate"] += 1
             continue
-        if prev is not None and last < pd.Timestamp(prev):
-            # 缝隙区：落后 ≥2 个交易日
-            #   data_loader 的容差是 3 天（落后 ≤3 天它不重拉），而 daily 接口只给最近两天、
-            #   缺中间交易日的**官方日增长率**——本脚本不猜（净值比在分红除权日口径不一致），
-            #   因此列入 catch-up 队列（逐只全历史重拉，口径最干净）。
+        # v1.1.3（2026-09-23）：接口按 latest→prev 给最近两天；**优先补最小缺口**——
+        #   若缓存落后 prev（如 last=9-21 而接口给 9-22/9-23），必须先补 prev=9-22，
+        #   而不是直接追 latest=9-23（否则序列断缝）。
+        avail = prev if (prev is not None and last < pd.Timestamp(prev)) else latest
+        nav_new = row.get(f"{avail}-单位净值")
+        if pd.isna(nav_new):
+            stat["nodata"] += 1
+            continue
+        # 缝隙区判定：缓存末日期与可补交易日 avail 是否**相邻交易日**（基准日历）。
+        #   相邻 → 只缺 avail，直接追加；不相邻 → 中间缺官方日增长率（如 last=9-18 而
+        #   avail=9-22，缺 9-21），本脚本不猜（净值比在分红除权日口径不一致）→ catch-up
+        #   队列逐只全历史重拉。
+        if bench_ns is not None:
+            _pi = int(np.searchsorted(bench_ns, last.to_datetime64(), side="right")) - 1
+            _pj = int(np.searchsorted(bench_ns, pd.Timestamp(avail).to_datetime64(), side="right")) - 1
+            adjacent = (_pj - _pi == 1)
+        else:
+            adjacent = (pd.Timestamp(avail) - last).days <= 2
+        if not adjacent:
             stat["gap"] += 1
-            gap_list.append((code, str(last.date()), int((pd.Timestamp(latest) - last).days)))
+            gap_list.append((code, str(last.date()), int((pd.Timestamp(avail) - last).days)))
             continue
         if dry_run:
             stat["updated"] += 1
             continue
+        if avail != latest:
+            stat["filled_prev"] = stat.get("filled_prev", 0) + 1
         new = pd.DataFrame([{
-            "date": pd.Timestamp(latest),
+            "date": pd.Timestamp(avail),
             "nav": nav_new,
-            "日增长率": row.get("日增长率"),
-            "nav_acc": row.get(f"{latest}-累计净值"),
+            "日增长率": row.get(f"{avail}-日增长率") if f"{avail}-日增长率" in row.index
+            else row.get("日增长率"),
+            "nav_acc": row.get(f"{avail}-累计净值"),
         }])
         out = (pd.concat([cache, new], ignore_index=True)
                .drop_duplicates("date", keep="last").sort_values("date"))
@@ -103,6 +123,8 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
     print(f"名单内未缓存（需 --backfill 回填）{stat['nocache']} 只 | "
           f"接口无数据 {stat['nodata']} 只 | "
           f"缝隙区（落后≥2交易日，data_loader不拉+daily补不了）{stat['gap']} 只")
+    if stat.get("filled_prev"):
+        print(f"其中 {stat['filled_prev']} 只按**前一交易日**补齐（当日净值尚未披露）")
     if gap_list:
         print("缝隙区样例（代码, 缓存末日期, 落后自然日）:", gap_list[:5])
 
