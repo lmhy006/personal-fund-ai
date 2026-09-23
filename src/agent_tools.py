@@ -246,9 +246,11 @@ def get_score(run_id=None, month=None):
 
 
 def get_top_funds(run_id=None, month=None, top_n=50):
-    if not isinstance(top_n, int) or top_n > TOP_N_MAX:
+    # v1.1.1 P1：真正整数区间（type 精确判断，拒绝负数/0/布尔/超上限/字符串）
+    if not (type(top_n) is int and 1 <= top_n <= TOP_N_MAX):
         return _env(status="not_executable",
-                    errors=[_err("research_boundary", f"top_n 仅用于查询展示（≤{TOP_N_MAX}），不改变冻结策略参数")])
+                    errors=[_err("research_boundary",
+                                 f"top_n 必须是整数且 1≤top_n≤{TOP_N_MAX}（仅查询展示，不改变冻结策略参数）")])
     if run_id is None:
         gate = _health_gate()
         if gate:
@@ -349,29 +351,40 @@ def get_portfolio_state():
 
 
 def get_shadow_status():
-    """影子状态（v1.1 P1-3）：以 _current_health 的 shadow_stale/shadow_factors 为权威判定；
-    最近影子以最新完整快照内 shadow CSV 为准（其次才看 ml/scores）。"""
+    """影子状态（v1.1 P1-3；v1.1.1 P1 边界修正）：以 _current_health 的 shadow_stale 为权威判定；
+    最近影子**只认最新完整快照内 shadow CSV**（v1.1.1：禁止回退到可覆盖的 ml/scores/）；
+    因子 fresh 但快照内无影子文件 → unavailable(no_current_shadow_snapshot)，不冒充当前评分。"""
     h = _current_health()
     fac = h.get("shadow_factors", {}) or {}
     stale = list(h.get("shadow_stale") or [])
     snaps = _complete_snapshots()
+    ref = snaps[-1] if snaps else None
+    ref_run = ref["run_id"] if ref else None
+    ref_cut = (ref["manifest"].get("data_cutoff") if ref else None)
+    ref_dir = ref["dir"] if ref else None
     last = None
-    if snaps:
-        p = _shadow_csv(snaps[-1])
+    if ref:
+        p = _shadow_csv(ref)
         if p:
-            last = os.path.basename(p)
-    if last is None and os.path.isdir(SCORES_DIR):
-        cands = sorted([f for f in os.listdir(SCORES_DIR) if f.startswith("shadow_")], reverse=True)
-        if cands:
-            last = cands[0]
+            last = os.path.basename(p)      # 快照内影子文件（快照中 2026-09 无影子 → None）
     detail = {"factors": fac, "stale": stale, "last_score": last,
-              "reference_snapshot": snaps[-1]["run_id"] if snaps else None,
-              "skip_reason": ("因子 stale：" + ",".join(stale)) if stale else None}
+              "reference_snapshot": ref_run,
+              "skip_reason": ("因子 stale：" + ",".join(stale)) if stale else
+              (None if last else "最新完整快照内无影子评分文件（影子已跳过），不得回退 ml/scores/")}
     if stale:
         return _env(status="unavailable", detail=detail, warnings=[],
                     errors=[_err("shadow_factor_stale", "最近影子评分不存在（因子陈旧，已按规则跳过）")],
+                    run_id=ref_run, data_cutoff=ref_cut, source_snapshot=ref_dir,
+                    provenance={"factors": fac})
+    if not ref or last is None:
+        return _env(status="unavailable", detail=detail, warnings=[],
+                    errors=[_err("no_current_shadow_snapshot",
+                                 "因子可用，但最新完整快照内没有影子评分文件（本轮影子被跳过），"
+                                 "按规则禁止以旧影子冒充当前")],
+                    run_id=ref_run, data_cutoff=ref_cut, source_snapshot=ref_dir,
                     provenance={"factors": fac})
     return _env(status="ok", detail=detail, warnings=[], errors=[],
+                run_id=ref_run, data_cutoff=ref_cut, source_snapshot=ref_dir,
                 provenance={"factors": fac})
 
 
@@ -450,7 +463,17 @@ def generate_research_report(topic="momentum_excess"):
             lines += ["- 说明：主策略为 ret_12m 动量 Top50（冻结）；费用后相对可执行全池超额未见可靠统计证据（Phase 3 冻结记录）。"]
     if topic == "shadow_status":
         st = get_shadow_status()
-        lines.append(f"- shadow 状态：{st['status']}（{st.get('detail', {}).get('skip_reason') or '可用'}）")
+        # v1.1.1 P1：影子报告必须传播底层停止状态（status/warnings/errors/run_id/source_snapshot），
+        # 报告正文可以保留，但不可把 unavailable 包装成成功
+        lines.append(f"- shadow 状态：{st['status']}"
+                     f"（{st.get('detail', {}).get('skip_reason') or '可用'}）"
+                     f"（reference={st.get('run_id')}）")
+        return _env(status=st["status"],
+                    detail={"topic": topic, "report": "\n".join(lines)},
+                    run_id=st.get("run_id"), data_cutoff=st.get("data_cutoff"),
+                    source_snapshot=st.get("source_snapshot"),
+                    warnings=st["warnings"], errors=st["errors"],
+                    provenance={"sources": src} if src else None)
     return _env(status="ok", detail={"topic": topic, "report": "\n".join(lines)},
                 provenance={"sources": src} if src else None)
 

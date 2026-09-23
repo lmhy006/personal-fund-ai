@@ -1,9 +1,9 @@
 # Phase 4 失败场景实测记录（PHASE4_FAILURE_SCENARIOS）
 
-> 验证时间：2026-09-21（Phase 4 设计阶段）。
+> 验证时间：2026-09-21（Phase 4 设计阶段；薄工具层 v1/v1.1/v1.1.1 已实现，2026-09-22）。
 > 验证方式：使用现有系统组件（`data_health.check`、快照文件系统、`ml/ledger`）对 Schema v1 的
-> **六类 Agent 停止条件**逐一做可检测性实测。薄工具层未实现——本文件证明"停止条件在系统里
-> 真实可被检测"，工具层按 Schema 契约包装即可。
+> **六类 Agent 停止条件**逐一做可检测性实测；薄工具层 `src/agent_tools.py` 已按本契约实现，
+> 且 `tests/test_agent_tools.py`（21 项测试）对每类停止条件做了实现层验证。
 > 结论：**六类停止条件全部可通过现有数据结构检测**，无需对生产系统做任何改动即可支撑 Agent 契约。
 
 ## T1／停止条件①：快照缺少 COMPLETE
@@ -46,8 +46,8 @@
 ## T5／停止条件⑤：请求涉及冻结参数变更
 
 - 该条**在 Schema 层固定**：`run_production_pipeline` 的接口**不接收** TopN/持有期/信号窗口/费率/eligibility/显著性/risk 参数；只读工具中 `top_n` 仅用于查询展示并有上限与 `research_boundary` 提示。
-- **实现层锁定（薄工具层落地时执行）**：① 工具签名断言（无策略参数）；② 入参白名单校验；③ 审计日志记录每次被拒的 `research_boundary` 请求。
-- 本轮未实现工具层，故以设计断言 + 上述双锁计划记录；不属于可执行测试范围。
+- **实现层锁定（已落地）**：① 工具签名断言（`run_production_pipeline` 零参数；只读工具 `top_n` 须为 1..200 整数）；② 入参白名单校验（`tests/test_agent_tools.py` 对 `-1/0/True/201/字符串/策略参数` 的拒绝均有断言）；③ 审计日志记录每次被拒的 `research_boundary` 请求（含 caller）。
+- 该条**已由测试覆盖**：`tests/test_agent_tools.py` 的 `test_strategy_params_rejected`、`test_topn_interval_rejected`、`test_unexposed_rejected`、`test_audit_for_rejected_calls` 等。
 
 ## T6／停止条件⑥：找不到对应月份的正式快照
 

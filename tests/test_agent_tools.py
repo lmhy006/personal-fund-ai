@@ -19,7 +19,7 @@ RUN1 = "20260921_090000"
 RUN2 = "20260922_100000"
 
 
-def _make_snapshot(root, run_id, as_of, generated_at, commit="c0f7d91"):
+def _make_snapshot(root, run_id, as_of, generated_at, commit="c0f7d91", has_shadow=False):
     d = os.path.join(root, "snapshots", run_id)
     os.makedirs(d, exist_ok=True)
     month = as_of[:7]
@@ -34,6 +34,9 @@ def _make_snapshot(root, run_id, as_of, generated_at, commit="c0f7d91"):
          "fund_name": "基金二号", "confidence": "main", "as_of": as_of},
     ])
     score.to_csv(os.path.join(d, f"{month}.csv"), index=False)
+    if has_shadow:      # 快照内影子评分（v1.1.1：影子状态只认快照内文件）
+        score[["fund_code", "score", "confidence"]].to_csv(
+            os.path.join(d, f"shadow_{month}.csv"), index=False)
     pd.DataFrame([{"fund_code": "000001", "rank": 1}, {"fund_code": "000002", "rank": 2}]) \
         .to_csv(os.path.join(d, "top50.csv"), index=False)
     st = {"last_month": month, "cohorts": {
@@ -83,7 +86,8 @@ class TestAgentTools(unittest.TestCase):
         snaps = os.path.join(root, "snapshots")
         os.makedirs(snaps, exist_ok=True)
         self.snap1 = _make_snapshot(root, RUN1, "2026-09-18", "2026-09-21T09:00:00")
-        self.snap2 = _make_snapshot(root, RUN2, "2026-09-21", "2026-09-22T10:00:00")
+        self.snap2 = _make_snapshot(root, RUN2, "2026-09-21", "2026-09-22T10:00:00",
+                                    has_shadow=True)   # RUN2 最新快照内含影子 CSV
         partial = os.path.join(snaps, "20260922_120000")
         os.makedirs(partial, exist_ok=True)
         with open(os.path.join(partial, "manifest.json"), "w", encoding="utf-8") as f:
@@ -112,6 +116,9 @@ class TestAgentTools(unittest.TestCase):
         agent_tools.VOLTARGET_REPORT = vt
         agent_tools.AUDIT_DIR = os.path.join(root, "agent_audit")
         os.makedirs(agent_tools.SCORES_DIR, exist_ok=True)
+        # 可覆盖目录放一个旧影子文件，验证影子状态**不回退**（v1.1.1 P1）
+        with open(os.path.join(agent_tools.SCORES_DIR, "shadow_2026-09.csv"), "w", encoding="utf-8") as f:
+            f.write("fund_code,score,confidence\n000001,2.0,main\n")
 
     def tearDown(self):
         for k, v in self._orig.items():
@@ -192,23 +199,80 @@ class TestAgentTools(unittest.TestCase):
         self.assertEqual(out3["detail"]["months"][0]["rank"], 1)     # rank_lowconf 列
         self.assertEqual(out3["detail"]["months"][0]["confidence"], "low")
 
-    # ---- T5-14 shadow 因子 fresh/stale 四种情形（P1-3）----
-    def test_shadow_four_cases(self):
-        cases = [
-            ([], "ok", None),
-            (["style_index_sz399006.csv"], "unavailable", "style_index_sz399006.csv"),
-            (["sw_industry(最旧 2026-09-18)"], "unavailable", "sw_industry"),
-            (["style_index_sz399006.csv", "style_index_sh000905.csv", "sw_industry(最旧 2026-09-18)"],
-             "unavailable", "style_index_sz399006.csv"),
-        ]
-        for stale, want_status, _first in cases:
-            with mock.patch.object(agent_tools, "_current_health", return_value={
-                    "status": "WARN", "score_ready": True, "benchmark_latest_date": "2026-09-21",
-                    "shadow_stale": stale, "shadow_factors": {}}):
-                out = agent_tools.call("get_shadow_status")
-                self.assertEqual(out["status"], want_status, stale)
-                if want_status == "unavailable":
-                    self.assertEqual(out["errors"][0]["code"], "shadow_factor_stale")
+    # ---- T5-14 shadow 权威判定（v1.1.1 P1：判 stale 用 shadow_stale、只认快照内影子）----
+    def test_shadow_authoritative(self):
+        def health(stale):
+            return {"status": "WARN" if stale else "PASS", "score_ready": True,
+                    "benchmark_latest_date": "2026-09-21",
+                    "shadow_stale": stale, "shadow_factors": {}}
+        shadow_csv = os.path.join(self.snap2, "shadow_2026-09.csv")
+        mv = os.path.join(self.snap2, "shadow_2026-09.csv.bak")
+        try:
+            # (删除最新快照影子与否 × stale 之 None/风格/行业) → 期望 status/code
+            cases = [
+                (True, [], "ok", None),                                 # fresh + 快照有影子 → ok
+                (False, [], "unavailable", "no_current_shadow_snapshot"),  # fresh + 无影子 → 不回退
+                (True, ["style_index_sz399006.csv"], "unavailable", "shadow_factor_stale"),
+                (True, ["sw_industry(最旧 2026-09-18)"], "unavailable", "shadow_factor_stale"),
+            ]
+            for has_file, stale, want, want_code in cases:
+                if has_file and not os.path.exists(shadow_csv):
+                    os.rename(mv, shadow_csv)
+                elif not has_file and os.path.exists(shadow_csv):
+                    os.rename(shadow_csv, mv)
+                with mock.patch.object(agent_tools, "_current_health", return_value=health(stale)):
+                    out = agent_tools.call("get_shadow_status")
+                self.assertEqual(out["status"], want, (has_file, stale))
+                if want == "unavailable":
+                    self.assertEqual(out["errors"][0]["code"], want_code, (has_file, stale))
+                # 快照引用必须带全（v1.1.1）：run_id/data_cutoff/source_snapshot
+                self.assertEqual(out["run_id"], RUN2)
+                self.assertEqual(out["data_cutoff"], "2026-09-21")
+                self.assertTrue(out["source_snapshot"].endswith(RUN2))
+                if want == "ok":
+                    self.assertEqual(out["detail"]["last_score"], "shadow_2026-09.csv")
+        finally:
+            if os.path.exists(mv) and not os.path.exists(shadow_csv):
+                os.rename(mv, shadow_csv)
+
+    # ---- v1.1.1 P1：因子 fresh 但快照内无影子 → 不回退 ml/scores/（目录里有旧文件也不采用）----
+    def test_shadow_no_fallback_to_scores_dir(self):
+        shadow_csv = os.path.join(self.snap2, "shadow_2026-09.csv")
+        mv = os.path.join(self.snap2, "shadow_2026-09.csv.bak")
+        self.assertTrue(os.path.exists(os.path.join(agent_tools.SCORES_DIR, "shadow_2026-09.csv")))
+        try:
+            os.rename(shadow_csv, mv)
+            out = agent_tools.call("get_shadow_status")     # fresh（setUpClass mock）
+            self.assertEqual(out["status"], "unavailable")
+            self.assertEqual(out["errors"][0]["code"], "no_current_shadow_snapshot")
+            self.assertEqual(out["detail"]["last_score"], None)   # 未采用 ml/scores 旧文件
+        finally:
+            os.rename(mv, shadow_csv)
+
+    # ---- v1.1.1 P1：报告传播底层 shadow 停止状态 ----
+    def test_report_propagates_shadow_unavailable(self):
+        shadow_csv = os.path.join(self.snap2, "shadow_2026-09.csv")
+        mv = os.path.join(self.snap2, "shadow_2026-09.csv.bak")
+        try:
+            os.rename(shadow_csv, mv)
+            out = agent_tools.call("generate_research_report", topic="shadow_status")
+            self.assertEqual(out["status"], "unavailable")       # 不可包装成 ok
+            self.assertEqual(out["errors"][0]["code"], "no_current_shadow_snapshot")
+            self.assertEqual(out["run_id"], RUN2)
+            self.assertTrue(out["source_snapshot"].endswith(RUN2))
+            self.assertIn("shadow 状态", out["detail"]["report"])  # 报告正文仍保留
+        finally:
+            os.rename(mv, shadow_csv)
+
+    # ---- v1.1.1 P1：top_n 必须为 1..200 的整数（负数/0/布尔/字符串/超限均拒绝）----
+    def test_topn_interval_rejected(self):
+        for bad in (-1, 0, True, 201, "50", 2.5):
+            out = agent_tools.call("get_top_funds", month="2026-09", top_n=bad)
+            self.assertEqual(out["status"], "not_executable", f"top_n={bad}")
+            self.assertEqual(out["errors"][0]["code"], "research_boundary", f"top_n={bad}")
+        for ok_n in (1, 200):
+            out = agent_tools.call("get_top_funds", month="2026-09", top_n=ok_n)
+            self.assertEqual(out["status"], "ok", f"top_n={ok_n}")
 
     # ---- T5-15 Top 名称/分数 与 组合溯源字段（P1-4/P1-5）----
     def test_top_details_and_portfolio_provenance(self):
