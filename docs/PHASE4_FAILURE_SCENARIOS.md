@@ -1,6 +1,6 @@
 # Phase 4 失败场景实测记录（PHASE4_FAILURE_SCENARIOS）
 
-> 验证时间：2026-09-21（Phase 4 设计阶段；薄工具层 v1/v1.1/v1.1.1 已实现，2026-09-22）。
+> 验证时间：2026-09-21（Phase 4 薄工具层开发期间）；薄工具层 v1/v1.1/v1.1.1 已于 2026-09-22 实现并验收。
 > 验证方式：使用现有系统组件（`data_health.check`、快照文件系统、`ml/ledger`）对 Schema v1 的
 > **六类 Agent 停止条件**逐一做可检测性实测；薄工具层 `src/agent_tools.py` 已按本契约实现，
 > 且 `tests/test_agent_tools.py`（21 项测试）对每类停止条件做了实现层验证。
@@ -71,7 +71,7 @@
 | ⑤ 冻结参数变更 | ✅ **已实现并测试**（`p4-agent-tools-v1`/`v1.1`：`tests/test_agent_tools.py` 18 项，含签名拒绝/白名单/research_boundary 审计） | 工具签名断言 + 入参白名单 + 审计 | not_executable + 审计记录 |
 | ⑥ 无该月正式快照 | ✅ 实测 | 快照目录 + COMPLETE 过滤 | 查询 → unavailable + 最近引用 |
 
-→ **6 项全部实现并由测试覆盖**（`tests/test_agent_tools.py`：18 项通过；fixture 隔离，不运行真实流水线）。
+→ **6 项全部实现并由测试覆盖**（`tests/test_agent_tools.py`：21 项通过；fixture 隔离，不运行真实流水线）。
 
 结论：在不改动生产系统的前提下，Agent 契约的停止条件（除 T5 权限拒绝外）都能被真实、可复现地检测；
 薄工具层只需按 `PHASE4_AGENT_SCHEMA.md` 包装这些读取路径即可。
