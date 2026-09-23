@@ -642,8 +642,41 @@ Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/
 | Phase 3 | **主要历史研究完成并冻结**（回测池含部分清盘基金；清盘名单覆盖 2014 后、属部分修复，**未声明幸存者偏差已彻底解决**） |
 | 风险控制 v1 | **风险目标达成，但策略转正门槛未全部通过**（保留为情景分析工具） |
 | Shadow strategies | **forward observation 中**（2026-09 起，标签 2027-03 后成熟） |
-| **Phase 3.5** | **完成（2026-09-21 验收通过）**：生产流水线/健康检查/组合 ledger/不可变快照；正式快照 `20260921_104949`（status=complete、SHA 可复现） |
+| **Phase 3.5** | **完成（2026-09-21 验收通过）**：生产流水线/健康检查/组合 ledger/不可变快照；权威正式快照 `20260922_104956`（status=complete、SHA 可复现、8 条一致性验证通过） |
 | Phase 4 | **薄工具层已完成并验收（v1.1.1，2026-09-22）**：`src/agent_tools.py` 注册 10 个只读工具 + 无参数 `run_production_pipeline()`（统一 envelope；只读工具不改 scores/ledger/snapshots、仅写 `logs/agent_audit/`；评分一律读快照内 CSV；月份查询固定选 score_generated_at 最新 + 全部候选 + 警告；当前查询 health FAIL 门禁、显式 run_id 历史审计标注、历史排名读 rank/rank_lowconf 列、top_n 限定 1..200 整数、影子只认快照内文件且报告传播停止状态、审计含 caller 且拒绝请求亦记录）；契约 `docs/PHASE4_AGENT_SCHEMA.md`、失败场景 `docs/PHASE4_FAILURE_SCENARIOS.md`（6 项全覆盖）、测试 `tests/test_agent_tools.py`（**21 项通过**）；**对话/LLM 接入暂缓**（待明确启动时再设计） |
+| **前向纸面运行期** | **当前阶段（2026-09-22 起）**：不新增模型、不接 LLM；按月人工运行积累**从未被查看/修改过的前向数据**（详见下节） |
+
+### 三点五、前向纸面运行期（Forward Paper Run，2026-09-22 起）
+
+项目当前缺的不是功能，而是**真正发生在未来、未被反复查看和修改过的验证数据**。因此在 2027 年之前**不新增模型、不搜索参数、不接 LLM**，只按月稳定运行并留痕。
+
+**生产语义（三条，已实现）**
+
+1. **月末信号门禁**：研究策略是月末调仓，生产系统此前允许月中完整运行。现在 `production_pipeline` 判定评分日是否为**当月最后工作日**（`_is_month_end`，工作日近似；节假日未精确建模 = production limitation）：
+   - `signal_mode=month_end` → 推进 6-cohort ledger（建/更新 cohort），快照写 **`COMPLETE`**；
+   - `signal_mode=observation` → **月中运行只作数据与评分观察**：照常刷新数据与评分，但**不推进正式 cohort**，快照写 **`NOT_COMPLETE_OBSERVATION`**（`status=observation`），不算正式 forward 记录。
+   - 当前 2026-09 cohort 保持 `planned`，**9-21 不作为正式建仓日**；月末用最终评分更新，随后由实际可交易日 `confirm_execution` 确认。
+2. **影子因子自动刷新**（`style_factors.refresh_all_shadow_factors`，流水线步骤）：刷新 **2 只风格指数 + 31 只申万一级行业指数**（单线程串行）→ 以刷新结果判定新鲜度 → fresh 则生成影子评分；**刷新失败或仍 stale 则明确跳过影子并记录原因，主策略照常**。此前流水线只检查不刷新，导致"影子前向证据积累不了"。
+3. **执行事件留痕**（`live_portfolio.confirm_execution`）：每次执行确认向独立不可变 `ml/ledger/execution_events.jsonl`（append-only）写入事件——`type`（**paper**/**actual**）、`cohort`、`source_run_id`、`confirmed_at`、`execution_date`、`operator`、以及确认后 ledger/state 的 **sha256**。现阶段明确采用 **paper 纸面组合**：项目未接交易系统、也没有可靠费用后超额证据，**不得把纸面 ledger 描述成真实持仓**。
+
+**三个月人工运行清单**（每月一次，确认每次都能完整走完）
+
+1. 刷新净值、基准与影子因子（`python src/production_pipeline.py` 一条命令含全部）；
+2. 数据健康检查通过（`PASS`/`WARN`，`FAIL` 中止）；
+3. 生成月末正式快照（`signal_mode=month_end`、`COMPLETE`）；
+4. 核对 Top50、影子策略与来源 `run_id`（`python src/agent_tools.py get_top_funds '{"month":"YYYY-MM"}'` 等只读工具）；
+5. 确认纸面执行并保存执行事件（`python src/live_portfolio.py --confirm-cohort YYYY-MM --execution-date YYYY-MM-DD --type paper --operator <名字>`）；
+6. 检查历史快照未被改变（`ml/snapshots/` 旧目录哈希不变）。
+
+三个月稳定后再交给 Windows 任务计划程序；对话/LLM 层可等到那时再接（届时才知道运营中最常问什么）。
+
+**评价时间点（写死，避免提前看结果）**
+
+- **2027-03 以后**：第一批六个月标签成熟，**只做数据完整性与计算正确性检查**（单月没有统计说服力）；
+- **约 2028-02～03**：积累约 12 个成熟月度 cohort 后，才允许做**第一次正式前向复核**；需考虑 6 个月标签重叠造成的有效样本减少（用 **NW(6)**）。
+- 评价沿用既定三条门槛：**相对原动量有增量、相对可执行全池为正、风险与换手没有明显恶化**；报告费用后收益、回撤与 NW(6)。
+
+**等待期间唯一值得单独开启的研究方向**：**Phase 5：经理任职与历史持仓的时点数据**——作为独立研究路线重新定义"经理能力"目标与基线，**不得修改已冻结的生产策略**。
 
 **研究目标（2026-09-18 重述）**：特征扩充的目的是**找到费用后稳定的组合增量**（相对全池），不是"让 ML 指标超过动量"；每组以费用后相对全池收益、回撤与分阶段表现评价，IC 仅作辅助；只在 dev 段内按时间滚动取舍。**清盘基金边界**：清盘历史池已部分并入（任务 3），但**并未消除**幸存者偏差——对外表述仍应为"现存 + 部分已清盘池的条件性历史研究"。**多重比较纪律（2026-09-19）**：第二组共试了 6 个相关方案、最高配对 NW 仅 +1.84，继续大量试规格会抬高偶然"最佳方案"的概率（数据窥探）——第三组已**预登记 4 个规格**（见任务 5 与 `ml/backtest/feature_group3_prereg.md`），非基线规格用 **Holm 校正**并报告总试验数。
 

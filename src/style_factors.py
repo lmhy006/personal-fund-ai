@@ -139,6 +139,43 @@ ALL_FACTOR_KEYS = ["mkt", "size", "growth"] + SECTOR_KEYS
 SECTOR_FIRST_VALID = "2014-02-24"    # 板块因子首个有效日（= 最晚发布的成分行业上市次日）
 
 
+def refresh_all_shadow_factors(sleep_sec: float = 0.25) -> dict:
+    """强制刷新影子依赖的全部指数缓存（2 只风格指数 + 31 只申万一级行业指数，单线程串行）。
+
+    前向纸面运行期用（2026-09-22 用户）：流水线先前置刷新这些因子，避免"因子过期导致影子
+    评分被跳过、前向证据积累不了"。失败只记录、不影响主策略。
+    :return: {"ok": n, "fail": [codes], "style": {symbol: 最新日}, "industry": {code: 最新日}}
+    """
+    import glob
+    import time as _t
+
+    out = {"ok": 0, "fail": [], "style": {}, "industry": {}}
+    # 2 只风格指数（新浪源，与沪深300基准同接口）
+    for sym, name in STYLE_INDICES.values():
+        try:
+            df = fetch_index_daily(sym, use_cache=False)
+            out["style"][sym] = str(df["date"].iloc[-1].date())
+            out["ok"] += 1
+            print(f"[影子因子] 风格指数 {sym}（{name}）刷新至 {out['style'][sym]}")
+        except Exception as e:  # noqa: BLE001
+            out["fail"].append(sym)
+            print(f"[影子因子] {sym} 刷新失败：{str(e)[:100]}")
+        _t.sleep(sleep_sec)
+    # 31 只申万一级行业指数（枚举磁盘现有缓存，代码全集与 data_health 检查一致）
+    codes = sorted({os.path.basename(p).replace("sw_industry_", "").replace(".csv", "")
+                    for p in glob.glob(os.path.join(RAW_DIR, "sw_industry_*.csv"))})
+    for code in codes:
+        try:
+            df = fetch_sw_industry(code, use_cache=False, sleep_sec=sleep_sec)
+            out["industry"][code] = str(df["date"].iloc[-1].date())
+            out["ok"] += 1
+        except Exception as e:  # noqa: BLE001
+            out["fail"].append(code)
+            print(f"[影子因子] 行业指数 {code} 刷新失败：{str(e)[:100]}")
+        _t.sleep(sleep_sec)
+    return out
+
+
 def sw_industry_cache_path(symbol: str) -> str:
     return os.path.join(RAW_DIR, f"sw_industry_{symbol}.csv")
 

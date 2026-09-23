@@ -171,11 +171,36 @@ def step_live_score(as_of: pd.Timestamp | None) -> tuple:
     return df, t_date, path, {"main": n_main, "low": n_low, "skip": skip, "verify": verify}
 
 
-def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
+def step_shadow_factors(data_cutoff: pd.Timestamp) -> dict:
+    """步骤（因子刷新）：强制刷新 2 只风格指数 + 31 只申万行业指数（单线程串行）。
+
+    前向纸面运行期（2026-09-22 用户）：不刷新则"因子过期 → 影子评分跳过 → 前向证据积累不了"。
+    刷新失败只记录、不影响主策略。
+    :return: {ok, fail, style, industry}（latest 日期），供 shadow 新鲜度判定。
+    """
+    log(f"步骤（因子刷新）刷新影子依赖的指数缓存（{data_cutoff.date()} 目标）…")
+    from style_factors import refresh_all_shadow_factors
+    res = refresh_all_shadow_factors(sleep_sec=0.25)
+    log(f"  刷新完成：ok={res['ok']} fail={res['fail']}")
+    return res
+
+
+def step_shadow_score(health: dict, data_cutoff: pd.Timestamp,
+                      factor_refresh: dict | None = None) -> tuple | None:
     log("步骤6/8 shadow_score（两条中性化影子，仅记录不参与资金决策）…")
     stale = health.get("shadow_stale") or []
+    # 若本轮已刷新因子，以刷新结果重新判定新鲜度（权威 fresh 判定）
+    if factor_refresh and not factor_refresh.get("fail"):
+        all_latest = {**factor_refresh.get("style", {}), **factor_refresh.get("industry", {})}
+        lag = sorted({k for k, v in all_latest.items()
+                      if pd.Timestamp(v) < data_cutoff - pd.Timedelta(days=2)})
+        if lag:
+            stale = [f"{k}({all_latest[k]})" for k in lag]
+        else:
+            stale = []
     if stale:
-        log(f"  ⚠️ shadow 因子 stale：{stale} → **跳过影子评分**（绝不用旧因子静默出最新影子）")
+        log(f"  ⚠️ shadow 因子 stale：{stale} → **跳过影子评分**（绝不用旧因子静默出最新影子）；"
+            f"主策略照常，原因已记录")
         return None, stale
     from shadow_score import shadow_scores
     sh, main, t_date = shadow_scores()
@@ -186,13 +211,33 @@ def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
     return path, None
 
 
-def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str):
-    log(f"步骤7/8 live_portfolio（6-cohort ledger，方案 A 逐步建仓；score_run={run_id}）…")
+def _is_month_end(ts: pd.Timestamp) -> bool:
+    """月末信号门禁近似判定（前向运行期）：评分日是否为**当月最后工作日**（周一至五近似）。
+
+    limitation：未精确建模节假日；三个月人工运行期由人把握"月末净值完整披露后"的触发时机，
+    本判定仅作辅助信号（manifest.signal_mode 如实记录，偏差可事后核对）。
+    """
+    import calendar
+    d = ts.date()
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    last_date = pd.Timestamp(d.year, d.month, last_day)
+    while last_date.weekday() >= 5:      # 周末回退到最后一个工作日
+        last_date -= pd.Timedelta(days=1)
+    return ts.date() == last_date.date()
+
+
+def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str,
+                   month_end: bool = True):
+    """月末正式运行 → 推进 6-cohort ledger（score_run=run_id）；月中观察 → 不推进。"""
+    mode = "month_end" if month_end else "observation"
+    log(f"步骤7/8 live_portfolio（{mode}；score_run={run_id}）…")
     from live_portfolio import LivePortfolio
     pf = LivePortfolio()
-    # P0 修复（2026-09-22 用户审查）：正式调用必须传入本次 run_id 作为 score_run，
-    # 使组合台账可追溯到权威 run_id（同月 planned 更新时不会保留旧来源）
-    action = pf.add_month(scores_df, score_run=run_id)
+    if month_end:
+        action = pf.add_month(scores_df, score_run=run_id)
+    else:
+        action = {"mode": "observation", "applied": False,
+                  "reason": "月中评分仅作数据与评分观察（月末信号规则），不推进正式 cohort"}
     agg = pf.aggregate()
     log(f"  本月动作：{json.dumps(action, ensure_ascii=False)}")
     log(f"  当前：{json.dumps({k: agg[k] for k in ('n_active', 'cash_weight', 'n_funds')}, ensure_ascii=False)}")
@@ -200,8 +245,14 @@ def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str):
 
 
 def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
-                  pf, action, agg, top50, test_mode: bool = False):
-    log("步骤8/8 不可变 snapshot…")
+                  pf, action, agg, top50, mode: str = "complete",
+                  shadow_factor_refresh=None):
+    """mode：complete（月末正式）/ test（skip 诊断）/ observation（月中观察）。
+
+    observation（前向运行期月末信号规则）：月中运行只作数据与评分观察，不推进正式 cohort，
+    快照写 NOT_COMPLETE_OBSERVATION、manifest status=observation，不算正式 forward 记录。
+    """
+    log(f"步骤8/8 不可变 snapshot…（mode={mode}）")
     snap = os.path.join(SNAPSHOTS_DIR, run_id)
     os.makedirs(snap, exist_ok=True)
     # 文件副本
@@ -218,9 +269,9 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
     manifest["portfolio"] = agg
     manifest["cohort_action"] = action
     manifest["top50"] = top50["fund_code"].tolist()
-    # 测试模式（含 skip 开关的诊断/重试运行）不得写 COMPLETE（v1.1 用户审查）：
-    #   正式 forward 记录必须来自完整流程
-    if test_mode:
+    manifest["shadow_factor_refresh"] = shadow_factor_refresh
+    # 只有"月末正式"运行才写 COMPLETE（v1.1.2 月末信号门禁 + v1.1 skip 规则）
+    if mode == "test":
         manifest["status"] = "test"
         with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
@@ -229,7 +280,16 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
                     f"原因：本次运行含 skip 开关（诊断/重试），非正式 forward 记录\n")
         log(f"  ⚠️ snapshot 已写入 {snap}（**NOT_COMPLETE_TEST**：含 skip 开关，非正式记录）")
         return snap
-    manifest["status"] = "complete"      # 只有全部步骤成功、快照落盘后才置 complete
+    if mode == "observation":
+        manifest["status"] = "observation"
+        with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
+        with open(os.path.join(snap, "NOT_COMPLETE_OBSERVATION"), "w", encoding="utf-8") as f:
+            f.write(f"{manifest['run_id']} observation_at={manifest['score_generated_at']}\n"
+                    f"原因：月中评分仅作数据与评分观察（月末信号规则），未推进正式 cohort\n")
+        log(f"  👁️ snapshot 已写入 {snap}（**NOT_COMPLETE_OBSERVATION**：月中观察，非正式记录）")
+        return snap
+    manifest["status"] = "complete"      # 只有全部步骤成功、月末正式、快照落盘后才置 complete
     with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
     # COMPLETE 标志：与 manifest.status=complete 一致；缺失即"半次正式运行"，可用 .bak/legacy 回滚
@@ -266,8 +326,18 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
     as_of_ts = pd.Timestamp(as_of) if as_of else None
     scores_df, t_date, scores_path, score_meta = step_live_score(as_of_ts)
     data_cutoff = t_date
-    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
-    pf, action, agg = step_portfolio(scores_df, t_date, run_id)
+
+    # 影子因子自动刷新（前向运行期）：失败只记录、不影响主策略；刷新后以结果判定新鲜度
+    factor_refresh = None
+    if not skip_refresh:
+        factor_refresh = step_shadow_factors(data_cutoff)
+    else:
+        log("（skip_refresh：跳过影子因子刷新）")
+    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff, factor_refresh)
+
+    # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
+    month_end = _is_month_end(data_cutoff)
+    pf, action, agg = step_portfolio(scores_df, t_date, run_id, month_end)
 
     main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
     top50 = main.sort_values("rank").head(TOP_N) if "rank" in main.columns else \
@@ -279,6 +349,7 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         "benchmark_cutoff": str(health["benchmark_latest_date"]),
         "factor_cutoff": health.get("shadow_factors"),
         "signal_date": str(data_cutoff.date()),
+        "signal_mode": "month_end" if month_end else "observation",   # 月末信号门禁（前向运行期）
         "score_generated_at": datetime.now().isoformat(timespec="seconds"),
         # 基准日历止于 data_cutoff 时无下一交易日 → None（null/pending），不得退回 signal_date
         "execution_date": next_trading_day(data_cutoff),
@@ -291,10 +362,13 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         "execution_semantics": "signal_date=评分日；execution_date=信号日后下一基准交易日；"
                                "基准日历止于 data_cutoff 时 execution_date=null（cohort 保持 "
                                "planned/pending，成交日确认后才 active，见 live_portfolio 的 "
-                               "confirm_execution）",
+                               "confirm_execution）；月末信号规则：signal_mode=month_end 才推进 "
+                               "正式 cohort 并写 COMPLETE，observation 仅作数据与评分观察",
     }
+    snapshot_mode = "test" if (skip_refresh or skip_clean) else \
+        ("complete" if month_end else "observation")
     snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
-                         test_mode=bool(skip_refresh or skip_clean))
+                         mode=snapshot_mode, shadow_factor_refresh=factor_refresh)
     with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
         f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
     log("✅ 流水线完成；正式评分与快照已生成"

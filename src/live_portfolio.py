@@ -29,6 +29,7 @@
 #   ml/ledger/portfolio_ledger.csv   （每 cohort × 每基金一行，含权重与时间字段）
 #   ml/ledger/portfolio_state.json   （当前 active cohorts、聚合目标权重、现金、最近动作、预计费用）
 import argparse
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -41,9 +42,21 @@ from panel_builder import BENCH_PATH
 LEDGER_DIR = os.path.join(PROJECT_ROOT, "ml", "ledger")
 LEDGER_PATH = os.path.join(LEDGER_DIR, "portfolio_ledger.csv")
 STATE_PATH = os.path.join(LEDGER_DIR, "portfolio_state.json")
+EXECUTION_EVENTS_PATH = os.path.join(LEDGER_DIR, "execution_events.jsonl")   # 不可变执行事件流（append-only）
 
 COHORT_WEIGHT = 1.0 / HOLD          # 每批权重（方案 A：恒 1/6，含前 5 个月）
 TOP_N = TOP_N_DEFAULT               # 50
+
+
+def _file_sha256(path: str) -> str | None:
+    """文件 sha256（执行事件的状态哈希用）；不存在返回 None。"""
+    if not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 LEDGER_COLS = ["cohort_id", "fund_code", "weight_in_cohort", "signal_date",
                "execution_date", "created_at", "expire_month", "status"]
@@ -194,18 +207,46 @@ class LivePortfolio:
         }
         return action
 
-    def confirm_execution(self, cohort_id: str, execution_date: str) -> dict:
-        """把 planned cohort 标记为 active（真实成交日确认后调用）；幂等。"""
+    def confirm_execution(self, cohort_id: str, execution_date: str,
+                          exec_type: str = "paper", operator: str = "local_user") -> dict:
+        """把 planned cohort 标记为 active（执行确认），并写入**不可变执行事件**。
+
+        前向纸面运行期（2026-09-22 用户）：现阶段明确采用 **paper 纸面组合**（未接交易系统、
+        无可靠费用后超额证据），不得把纸面 ledger 描述成真实持仓。
+        :param exec_type: "paper"（默认）| "actual"
+        :param operator: 操作人（对话适配层/人工提供；默认 local_user）
+        :return: 事件记录（已 append 到 execution_events.jsonl）
+        """
         if cohort_id not in self.state["cohorts"]:
             raise KeyError(f"cohort {cohort_id} 不存在")
+        if exec_type not in ("paper", "actual"):
+            raise ValueError(f"exec_type 仅允许 paper/actual，收到 {exec_type!r}")
         meta = self.state["cohorts"][cohort_id]
+        if meta.get("status") == "expired":
+            raise ValueError(f"cohort {cohort_id} 已 expired，不能确认执行")
         meta["execution_date"] = execution_date
         meta["status"] = "active"
+        meta["exec_type"] = exec_type
         self.state["cohorts"][cohort_id] = meta
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "execution_date"] = execution_date
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "status"] = "active"
         self.save()
-        return {"cohort_id": cohort_id, "execution_date": execution_date, "status": "active"}
+        # 不可变执行事件（append-only；哈希为**确认后** ledger/state 的状态）
+        ev = {
+            "event_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "type": exec_type,
+            "cohort": cohort_id,
+            "source_run_id": meta.get("score_run"),
+            "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+            "execution_date": execution_date,
+            "operator": operator,
+            "ledger_sha256": _file_sha256(self.ledger_path),
+            "state_sha256": _file_sha256(self.state_path),
+        }
+        os.makedirs(LEDGER_DIR, exist_ok=True)
+        with open(EXECUTION_EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        return ev
 
     @property
     def first_month(self) -> str | None:
@@ -256,10 +297,26 @@ class LivePortfolio:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Phase 3.5 生产组合：6-cohort ledger 维护")
+    ap = argparse.ArgumentParser(description="Phase 3.5 生产组合：6-cohort ledger 维护 / 纸面执行确认")
     ap.add_argument("--scores", help="本月评分快照 CSV（ml/scores/YYYY-MM.csv）；缺省取最近一份")
+    ap.add_argument("--confirm-cohort", help="确认执行某个 planned cohort（不填=走 add_month 建仓/更新）")
+    ap.add_argument("--execution-date", help="执行确认的实际可交易日 YYYY-MM-DD")
+    ap.add_argument("--type", dest="exec_type", default="paper", choices=("paper", "actual"),
+                    help="执行类型（默认 paper 纸面组合；actual 仅在未来接真实交易后使用）")
+    ap.add_argument("--operator", default="local_user", help="操作人（人工提供）")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
+
+    pf = LivePortfolio()
+    if args.confirm_cohort:
+        if not args.execution_date:
+            raise SystemExit("--confirm-cohort 必须配合 --execution-date YYYY-MM-DD")
+        ev = pf.confirm_execution(args.confirm_cohort, args.execution_date,
+                                  args.exec_type, args.operator)
+        print("== live_portfolio 执行确认 ==")
+        print("  事件:", json.dumps(ev, ensure_ascii=False))
+        print(f"  events 追加至: {EXECUTION_EVENTS_PATH}")
+        return
 
     scores_path = args.scores
     if scores_path is None:
@@ -270,7 +327,6 @@ def main():
             raise SystemExit("未找到评分快照，请先运行 live_score / production_pipeline")
         scores_path = os.path.join(PROJECT_ROOT, "ml", "scores", cands[0])
     scores = pd.read_csv(scores_path, dtype={"fund_code": str})
-    pf = LivePortfolio()
     action = pf.add_month(scores)
     agg = pf.aggregate()
     print("== live_portfolio ==")
