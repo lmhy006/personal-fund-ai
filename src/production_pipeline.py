@@ -371,6 +371,20 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         "strategy_version": STRATEGY_VERSION,
         "data_cutoff": str(data_cutoff.date()),
         "benchmark_cutoff": str(health["benchmark_latest_date"]),
+        "raw_cutoff": health.get("raw_latest_date"),
+        "processed_cutoff": health.get("processed_latest_date"),
+        "processed_dist": health.get("processed_dist"),
+        "stale_n": health.get("stale_n"),
+        "gap_n": health.get("gap_n"),
+        # 月末核验记录（P1 2026-09-24）：month_end 正式运行要求 stale_n==0 且
+        # processed_dist.median == data_cutoff（_check_month_end_data_ready 强制，不满足即中止）；
+        # 该组字段让快照 manifest 自带"月末净值齐全"证据，事后可复核。
+        "month_end_data_ready": None if not month_end else {
+            "signal_mode": "month_end", "stale_n": health.get("stale_n"),
+            "gap_n": health.get("gap_n"),
+            "processed_median": str((health.get("processed_dist") or {}).get("median")),
+            "criteria": "stale_n==0 且 processed_dist.median==data_cutoff（检查见 "
+                        "production_pipeline._check_month_end_data_ready）"},
         "factor_cutoff": health.get("shadow_factors"),
         "signal_date": str(data_cutoff.date()),
         "signal_mode": "month_end" if month_end else "observation",   # 月末信号门禁（前向运行期）
