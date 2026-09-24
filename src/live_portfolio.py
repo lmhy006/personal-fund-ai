@@ -213,9 +213,16 @@ class LivePortfolio:
 
         前向纸面运行期（2026-09-22 用户）：现阶段明确采用 **paper 纸面组合**（未接交易系统、
         无可靠费用后超额证据），不得把纸面 ledger 描述成真实持仓。
+        幂等语义（2026-09-23 用户审查 P0-2）：
+          - 仅 **planned→active** 允许转换；
+          - **完全相同**的重复调用返回既有事件（`idempotent=True`），**不追加**新事件；
+          - active 后不同日期/类型的调用**拒绝**，需显式 `correct_execution` 写
+            `execution_correction` 事件修正；
+          - 校验：execution_date 格式 YYYY-MM-DD、晚于 signal_date、**不早于今天**
+            （不许提前确认尚未发生的执行日期）、来源 run_id 对应正式完整快照（COMPLETE）。
         :param exec_type: "paper"（默认）| "actual"
         :param operator: 操作人（对话适配层/人工提供；默认 local_user）
-        :return: 事件记录（已 append 到 execution_events.jsonl）
+        :return: 事件记录（首次确认已 append 到 execution_events.jsonl；幂等重试返回既有事件）
         """
         if cohort_id not in self.state["cohorts"]:
             raise KeyError(f"cohort {cohort_id} 不存在")
@@ -224,6 +231,17 @@ class LivePortfolio:
         meta = self.state["cohorts"][cohort_id]
         if meta.get("status") == "expired":
             raise ValueError(f"cohort {cohort_id} 已 expired，不能确认执行")
+        self._validate_execution(meta, execution_date)
+
+        if meta.get("status") == "active":
+            prev = self._latest_exec_event(cohort_id)
+            if prev and prev.get("execution_date") == execution_date and prev.get("type") == exec_type:
+                return {**prev, "idempotent": True}          # 完全相同重试：不追加事件
+            raise ValueError(
+                f"cohort {cohort_id} 已 active 且确认内容不同（现有 {prev.get('type') if prev else '?'}/"
+                f"{prev.get('execution_date') if prev else '?'}）——如需修正请用 correct_execution "
+                f"写显式 execution_correction 事件")
+
         meta["execution_date"] = execution_date
         meta["status"] = "active"
         meta["exec_type"] = exec_type
@@ -231,8 +249,87 @@ class LivePortfolio:
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "execution_date"] = execution_date
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "status"] = "active"
         self.save()
-        # 不可变执行事件（append-only；哈希为**确认后** ledger/state 的状态）
+        ev = self._build_exec_event("paper" if exec_type == "paper" else "actual",
+                                    cohort_id, execution_date, operator)
+        self._append_event(ev)
+        return ev
+
+    def correct_execution(self, cohort_id: str, new_execution_date: str, new_exec_type: str,
+                          reason: str, operator: str = "local_user") -> dict:
+        """**显式修正**已确认的执行事实：写 `execution_correction` 事件并更新状态（幂等修正可重复）。
+
+        仅允许对 active cohort 修正日期/类型；校验同 confirm_execution。
+        """
+        if cohort_id not in self.state["cohorts"]:
+            raise KeyError(f"cohort {cohort_id} 不存在")
+        if new_exec_type not in ("paper", "actual"):
+            raise ValueError(f"new_exec_type 仅允许 paper/actual，收到 {new_exec_type!r}")
+        if not reason or not str(reason).strip():
+            raise ValueError("reason 必填（显式修正必须说明原因）")
+        meta = self.state["cohorts"][cohort_id]
+        if meta.get("status") != "active":
+            raise ValueError(f"cohort {cohort_id} 尚未 active，无需修正（先 confirm_execution）")
+        self._validate_execution(meta, new_execution_date)
+        old_date, old_type = meta.get("execution_date"), meta.get("exec_type")
+        meta["execution_date"] = new_execution_date
+        meta["exec_type"] = new_exec_type
+        self.state["cohorts"][cohort_id] = meta
+        self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "execution_date"] = new_execution_date
+        self.save()
         ev = {
+            "event_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "type": "execution_correction",
+            "cohort": cohort_id,
+            "source_run_id": meta.get("score_run"),
+            "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+            "execution_date": new_execution_date,
+            "operator": operator,
+            "previous": {"execution_date": old_date, "exec_type": old_type},
+            "reason": str(reason).strip(),
+            "ledger_sha256": _file_sha256(self.ledger_path),
+            "state_sha256": _file_sha256(self.state_path),
+        }
+        self._append_event(ev)
+        return ev
+
+    # ---- 执行确认辅助 ----
+    def _validate_execution(self, meta: dict, execution_date: str):
+        try:
+            d = pd.Timestamp(execution_date)
+        except Exception:  # noqa: BLE001
+            raise ValueError(f"execution_date 需为合法日期 YYYY-MM-DD，收到 {execution_date!r}") from None
+        if d.strftime("%Y-%m-%d") != execution_date:
+            raise ValueError(f"execution_date 格式须为 YYYY-MM-DD，收到 {execution_date!r}")
+        sig = pd.Timestamp(meta.get("signal_date"))
+        if d <= sig:
+            raise ValueError(f"execution_date（{execution_date}）必须晚于 signal_date（{meta.get('signal_date')}）")
+        if d.date() > datetime.now().date():
+            raise ValueError(f"不允许提前确认尚未发生的执行日期（{execution_date} 在未来）")
+        src = meta.get("score_run")
+        if not src:
+            raise ValueError("cohort 缺少来源 run_id（score_run），无法校验正式快照")
+        snap_dir = os.path.join(PROJECT_ROOT, "ml", "snapshots", src)
+        if not os.path.exists(os.path.join(snap_dir, "COMPLETE")):
+            raise ValueError(f"来源 run_id={src} 不是正式完整快照（缺 COMPLETE），不能确认执行")
+
+    def _latest_exec_event(self, cohort_id: str) -> dict | None:
+        if not os.path.exists(EXECUTION_EVENTS_PATH):
+            return None
+        last = None
+        with open(EXECUTION_EVENTS_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("cohort") == cohort_id and ev.get("type") in ("paper", "actual"):
+                    last = ev
+        return last
+
+    def _build_exec_event(self, exec_type: str, cohort_id: str, execution_date: str,
+                          operator: str) -> dict:
+        meta = self.state["cohorts"][cohort_id]
+        return {
             "event_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
             "type": exec_type,
             "cohort": cohort_id,
@@ -243,10 +340,11 @@ class LivePortfolio:
             "ledger_sha256": _file_sha256(self.ledger_path),
             "state_sha256": _file_sha256(self.state_path),
         }
+
+    def _append_event(self, ev: dict):
         os.makedirs(LEDGER_DIR, exist_ok=True)
         with open(EXECUTION_EVENTS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        return ev
 
     @property
     def first_month(self) -> str | None:

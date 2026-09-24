@@ -171,33 +171,25 @@ def step_live_score(as_of: pd.Timestamp | None) -> tuple:
     return df, t_date, path, {"main": n_main, "low": n_low, "skip": skip, "verify": verify}
 
 
-def step_shadow_factors(data_cutoff: pd.Timestamp) -> dict:
+def step_shadow_factors() -> dict:
     """步骤（因子刷新）：强制刷新 2 只风格指数 + 31 只申万行业指数（单线程串行）。
 
-    前向纸面运行期（2026-09-22 用户）：不刷新则"因子过期 → 影子评分跳过 → 前向证据积累不了"。
-    刷新失败只记录、不影响主策略。
-    :return: {ok, fail, style, industry}（latest 日期），供 shadow 新鲜度判定。
+    前向纸面运行期（2026-09-22 用户）：**必须在 data_health 之前执行**——否则健康检查用的是
+    刷新前的因子状态，manifest.factor_cutoff 与 data_health.json 都会保留旧值（2026-09-23 P1
+    审查）。刷新失败只记录、不影响主策略。返回刷新摘要供 manifest。
     """
-    log(f"步骤（因子刷新）刷新影子依赖的指数缓存（{data_cutoff.date()} 目标）…")
+    log("步骤（因子刷新）刷新影子依赖的指数缓存…")
     from style_factors import refresh_all_shadow_factors
     res = refresh_all_shadow_factors(sleep_sec=0.25)
     log(f"  刷新完成：ok={res['ok']} fail={res['fail']}")
     return res
 
 
-def step_shadow_score(health: dict, data_cutoff: pd.Timestamp,
-                      factor_refresh: dict | None = None) -> tuple | None:
+def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
     log("步骤6/8 shadow_score（两条中性化影子，仅记录不参与资金决策）…")
+    # P1（2026-09-23 审查）：新鲜度判定**只用刷新后重跑的 data_health.shadow_stale**
+    #   （data_health 严格按"因子最新日 < benchmark"判定，无临时自然日容差）。
     stale = health.get("shadow_stale") or []
-    # 若本轮已刷新因子，以刷新结果重新判定新鲜度（权威 fresh 判定）
-    if factor_refresh and not factor_refresh.get("fail"):
-        all_latest = {**factor_refresh.get("style", {}), **factor_refresh.get("industry", {})}
-        lag = sorted({k for k, v in all_latest.items()
-                      if pd.Timestamp(v) < data_cutoff - pd.Timedelta(days=2)})
-        if lag:
-            stale = [f"{k}({all_latest[k]})" for k in lag]
-        else:
-            stale = []
     if stale:
         log(f"  ⚠️ shadow 因子 stale：{stale} → **跳过影子评分**（绝不用旧因子静默出最新影子）；"
             f"主策略照常，原因已记录")
@@ -311,14 +303,19 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
 
     health = None
     scores_path = None
+    factor_refresh = None
     if not skip_refresh:
         step_benchmark()
         step_raw()
         if not skip_clean:
             step_clean()
+        # P1（2026-09-23 审查）：**因子刷新必须在 data_health 之前**——否则健康检查/因子截止日
+        #   用的是刷新前旧状态（行业指数可能落后评分日却仍被描述 fresh）。
+        factor_refresh = step_shadow_factors()
     else:
-        log("（skip_refresh：跳过数据刷新）")
+        log("（skip_refresh：跳过数据刷新与影子因子刷新）")
 
+    # 数据健康（**刷新因子之后**重跑：factor_cutoff 与 shadow_stale 均为最新口径）
     health = step_health()
     if health["status"] == "FAIL":
         raise RuntimeError(f"data_health FAIL（{health.get('shadow_stale', '')}）→ 中止评分")
@@ -327,13 +324,7 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
     scores_df, t_date, scores_path, score_meta = step_live_score(as_of_ts)
     data_cutoff = t_date
 
-    # 影子因子自动刷新（前向运行期）：失败只记录、不影响主策略；刷新后以结果判定新鲜度
-    factor_refresh = None
-    if not skip_refresh:
-        factor_refresh = step_shadow_factors(data_cutoff)
-    else:
-        log("（skip_refresh：跳过影子因子刷新）")
-    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff, factor_refresh)
+    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
 
     # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
     month_end = _is_month_end(data_cutoff)

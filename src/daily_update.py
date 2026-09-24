@@ -96,18 +96,30 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
             adjacent = (pd.Timestamp(avail) - last).days <= 2
         if not adjacent:
             stat["gap"] += 1
-            gap_list.append((code, str(last.date()), int((pd.Timestamp(avail) - last).days)))
+            gap_list.append((code, str(last.date()), int((pd.Timestamp(avail) - last).days),
+                             "gap_between_trading_days"))
             continue
         if dry_run:
             stat["updated"] += 1
             continue
+        # P0-1（2026-09-23 用户审查）：接口**没有日期专属日增长率列**——只有属于最新日的
+        #   单列"日增长率"。若 avail != latest（补 prev），写 latest 的增长率会**污染收益**
+        #   （实测 8,668 只 9-22 与 9-23 增长率完全相同）。规则：avail 的日期专属增长率不可得
+        #   → **不追加**，该基金列入 catch-up（逐基金完整历史重拉，官方历史含正确增长率）。
+        if avail != latest:
+            ret_col = f"{avail}-日增长率"
+            if ret_col not in row.index or pd.isna(row.get(ret_col)):
+                stat["gap"] += 1
+                stat["no_growth_prev"] = stat.get("no_growth_prev", 0) + 1
+                gap_list.append((code, str(last.date()), int((pd.Timestamp(avail) - last).days),
+                                 "no_daily_return_for_prev"))
+                continue
         if avail != latest:
             stat["filled_prev"] = stat.get("filled_prev", 0) + 1
         new = pd.DataFrame([{
             "date": pd.Timestamp(avail),
             "nav": nav_new,
-            "日增长率": row.get(f"{avail}-日增长率") if f"{avail}-日增长率" in row.index
-            else row.get("日增长率"),
+            "日增长率": row.get(f"{avail}-日增长率"),
             "nav_acc": row.get(f"{avail}-累计净值"),
         }])
         out = (pd.concat([cache, new], ignore_index=True)
@@ -125,8 +137,10 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
           f"缝隙区（落后≥2交易日，data_loader不拉+daily补不了）{stat['gap']} 只")
     if stat.get("filled_prev"):
         print(f"其中 {stat['filled_prev']} 只按**前一交易日**补齐（当日净值尚未披露）")
+    if stat.get("no_growth_prev"):
+        print(f"其中 {stat['no_growth_prev']} 只因**prev 无日期专属增长率**不追加，转入全历史重拉")
     if gap_list:
-        print("缝隙区样例（代码, 缓存末日期, 落后自然日）:", gap_list[:5])
+        print("缝隙区样例（代码, 缓存末日期, 落后自然日, 原因）:", gap_list[:5])
 
     # 缝隙区补齐：落后 ≥2 个交易日的基金既不在 data_loader 的 3 天容差内被重拉，
     # 也超出 daily 接口能力 → 默认自动逐只补齐（数量少时无感）；
@@ -140,7 +154,8 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
         print(f"\n>>> catch-up：逐只全历史重拉 {len(todo)} 只缝隙区基金"
               f"（预计 {len(todo) * (sleep_sec + 1) / 60:.1f} 分钟）...")
         ok = fail = 0
-        for i, (code, _last, _days) in enumerate(todo, 1):
+        for i, item in enumerate(todo, 1):
+            code = item[0]
             df = load_single_fund(code, use_cache=False)   # 强制重拉，忽略缓存
             ok += df is not None
             fail += df is None

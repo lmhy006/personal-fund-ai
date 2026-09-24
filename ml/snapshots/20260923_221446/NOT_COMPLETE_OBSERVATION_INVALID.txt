@@ -1,0 +1,6 @@
+本快照为**运营故障演练记录，非有效前向评分证据**（2026-09-23 用户审查）。
+invalid_reason=wrong_prev_daily_return
+说明：daily_update 补 prev（2026-09-22）时接口无日期专属日增长率列，曾回退写入属于 latest（2026-09-23）
+的单列"日增长率"，导致 9-22 行收益率错误（实测 8,668 只与 9-23 完全相同），污染已进入本次 processed/
+评分/影子。修复见 src/repair_daily_contamination.py（全历史重拉）与 src/daily_update.py（prev 无
+专属增长率则不补、转 catch-up）。本快照按用户要求**保留原样**（不删除、不改写），仅以此文件标注失效。
