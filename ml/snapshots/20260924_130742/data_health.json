@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-09-24T13:12:56",
+  "benchmark_latest": "2026-09-23 00:00:00",
+  "benchmark_latest_date": "2026-09-23",
+  "raw_latest": "2026-09-23 00:00:00",
+  "raw_latest_date": "2026-09-23",
+  "raw_funds": 11418,
+  "processed_dist": {
+    "median": "2026-09-23",
+    "p25": "2026-09-23",
+    "min": "2026-09-17",
+    "max": "2026-09-23",
+    "n_funds": 5317,
+    "n_at_max": 5313,
+    "n_behind_max_gt1d": 4
+  },
+  "processed_latest_date": "2026-09-23",
+  "processed_funds": 5317,
+  "stale_n": 0,
+  "gap_n": 4,
+  "gap_scope": "alive 现存池，交易日口径（gap=落后≥2交易日）",
+  "catchup": "见最近 pipeline manifest（data_health 独立运行不拉取）",
+  "shadow_factors": {
+    "style_index_sh000905.csv": "2026-09-23 00:00:00",
+    "style_index_sz399006.csv": "2026-09-23 00:00:00",
+    "sw_industry": {
+      "n_files": 31,
+      "min_date": "2026-09-23",
+      "max_date": "2026-09-23",
+      "behind_max": []
+    }
+  },
+  "last_scores": {
+    "file": "2026-09.csv",
+    "as_of": "2026-09-23",
+    "total": 5119,
+    "main": 4908,
+    "low": 211
+  },
+  "shadow_stale": [],
+  "status": "PASS",
+  "score_ready": true
+}
