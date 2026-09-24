@@ -16,6 +16,15 @@
 import argparse
 import os
 
+# —— Windows 输出编码兜底（2026-09-24）：管道/重定向 stdout 默认 GBK，print ✅/⚠️ 等符号会崩
+import sys
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import numpy as np
 import pandas as pd
 

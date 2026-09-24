@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -130,6 +131,33 @@ class TestExecutionEvent(unittest.TestCase):
         self.assertEqual(ev["type"], "actual")
         with self.assertRaises(ValueError):
             self.pf.confirm_execution("2026-09", "2026-09-21", exec_type="real")
+
+    def test_append_failure_rolls_back_to_planned(self):
+        """P1（2026-09-24 审计）：事件追加失败 → 回滚为 planned，不留"active 无事件"不一致态。"""
+        with mock.patch.object(self.pf, "_append_event", side_effect=OSError("disk full")):
+            with self.assertRaises(RuntimeError):
+                self.pf.confirm_execution("2026-09", "2026-09-21", exec_type="paper")
+        self.assertEqual(self.pf.state["cohorts"]["2026-09"]["status"], "planned")
+        self.assertIsNone(self.pf.state["cohorts"]["2026-09"].get("execution_date"))
+        self.assertFalse(os.path.exists(lp.EXECUTION_EVENTS_PATH))    # 无残留事件
+        # 回滚后可安全重试
+        ev = self.pf.confirm_execution("2026-09", "2026-09-21", exec_type="paper")
+        self.assertEqual(ev["type"], "paper")
+        self.assertEqual(self.pf.state["cohorts"]["2026-09"]["status"], "active")
+
+    def test_recover_execution_missing_event(self):
+        """P1（2026-09-24 审计）：active 但事件缺失（历史失败窗口遗留）→ recover 补写事件。"""
+        self.pf.confirm_execution("2026-09", "2026-09-21", exec_type="paper")
+        os.remove(lp.EXECUTION_EVENTS_PATH)   # 模拟"状态已 active 但事件文件丢失"
+        rec = self.pf.recover_execution("2026-09", operator="tester")
+        self.assertTrue(rec.get("recovered_from_missing_event"))
+        self.assertEqual(rec["source_run_id"], "20260930_100000")
+        self.assertEqual(rec["execution_date"], "2026-09-21")
+        self.assertEqual(rec["operator"], "tester")
+        # 已有事件 → 无需恢复（幂等）
+        rec2 = self.pf.recover_execution("2026-09")
+        self.assertFalse(rec2.get("recovered", False))
+        self.assertEqual(rec2.get("note"), "已有确认事件，无需恢复")
 
     def test_unknown_cohort_rejected(self):
         with self.assertRaises(KeyError):

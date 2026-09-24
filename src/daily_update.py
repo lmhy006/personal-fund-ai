@@ -20,6 +20,15 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 
+# —— Windows 输出编码兜底（2026-09-24）：管道/重定向 stdout 默认 GBK，print ⚠️ 等符号会崩
+import sys
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
@@ -88,10 +97,16 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
         #   相邻 → 只缺 avail，直接追加；不相邻 → 中间缺官方日增长率（如 last=9-18 而
         #   avail=9-22，缺 9-21），本脚本不猜（净值比在分红除权日口径不一致）→ catch-up
         #   队列逐只全历史重拉。
-        if bench_ns is not None:
-            _pi = int(np.searchsorted(bench_ns, last.to_datetime64(), side="right")) - 1
-            _pj = int(np.searchsorted(bench_ns, pd.Timestamp(avail).to_datetime64(), side="right")) - 1
-            adjacent = (_pj - _pi == 1)
+        if bench_ns is not None and len(bench_ns):
+            bmax_ns = bench_ns[-1]
+            if pd.Timestamp(avail).to_datetime64() > bmax_ns:
+                # avail 是**超出基准日历**的新交易日（当日基准数据尚未入库）：
+                #   与 last 相邻 ⇔ last 恰为基准日历最后一日（否则中间缺交易日）
+                adjacent = (last.to_datetime64() == bmax_ns)
+            else:
+                _pi = int(np.searchsorted(bench_ns, last.to_datetime64(), side="right")) - 1
+                _pj = int(np.searchsorted(bench_ns, pd.Timestamp(avail).to_datetime64(), side="right")) - 1
+                adjacent = (_pj - _pi == 1)
         else:
             adjacent = (pd.Timestamp(avail) - last).days <= 2
         if not adjacent:
@@ -116,10 +131,16 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
                 continue
         if avail != latest:
             stat["filled_prev"] = stat.get("filled_prev", 0) + 1
+            # P0（2026-09-24 用户审计）：prev 无日期专属增长率 → 不追加（已在上方 catch-up）
+            nav_ret = row.get(f"{avail}-日增长率")          # 存在才走到这里（上一分支已校验）
+        else:
+            # P0（2026-09-24 用户审计）：**latest 的官方增长率是单列 `日增长率`**——
+            #   日期专属列不存在，旧代码读 `{latest}-日增长率` 得空值 → clean_nav 删该日。
+            nav_ret = row.get("日增长率")
         new = pd.DataFrame([{
             "date": pd.Timestamp(avail),
             "nav": nav_new,
-            "日增长率": row.get(f"{avail}-日增长率"),
+            "日增长率": nav_ret,
             "nav_acc": row.get(f"{avail}-累计净值"),
         }])
         out = (pd.concat([cache, new], ignore_index=True)

@@ -29,6 +29,14 @@ import sys
 import traceback
 from datetime import datetime
 
+# —— Windows 输出编码兜底（2026-09-24）：管道/重定向 stdout 默认 GBK，print ⚠️/✅/👁️ 等符号会崩
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -218,6 +226,28 @@ def _is_month_end(ts: pd.Timestamp) -> bool:
     return ts.date() == last_date.date()
 
 
+def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp):
+    """月末正式运行前置门禁（2026-09-24 用户审计 P1）：
+
+    data_health=PASS 只说明无 FAIL 项——processed 中位可落后 raw 最多 3 天、stale 只计 WARN，
+    若 9-30 多数净值只到 9-29 仍可能按 9-30 基准生成 COMPLETE。因此 month_end 运行额外要求：
+      ① 现存池 stale_n == 0（净值全部追平评分日）；
+      ② processed 中位日期 == 评分日（净值主体已到）。
+    不满足 → 中止（等净值完整披露或先 --catch-up），绝不生成"假月末"正式快照。
+    """
+    stale_n = health.get("stale_n") or 0
+    if stale_n > 0:
+        raise RuntimeError(
+            f"月末门禁：现存池仍有 {stale_n} 只净值落后评分日（{data_cutoff.date()}）——"
+            f"净值未齐全，请等披露或先 --catch-up，再正式运行")
+    proc = health.get("processed_dist") or {}
+    med = proc.get("median")
+    if med is not None and pd.Timestamp(med).date() != data_cutoff.date():
+        raise RuntimeError(
+            f"月末门禁：processed 中位日期 {pd.Timestamp(med).date()} ≠ 评分日 "
+            f"{data_cutoff.date()}——净值主体未到评分日，禁止生成月末正式快照")
+
+
 def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str,
                    month_end: bool = True):
     """月末正式运行 → 推进 6-cohort ledger（score_run=run_id）；月中观察 → 不推进。"""
@@ -328,6 +358,9 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
 
     # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
     month_end = _is_month_end(data_cutoff)
+    if month_end:
+        # P1（2026-09-24）：月末正式运行前必须**净值齐全**（stale==0 且 processed 中位==评分日）
+        _check_month_end_data_ready(health, data_cutoff)
     pf, action, agg = step_portfolio(scores_df, t_date, run_id, month_end)
 
     main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df

@@ -249,10 +249,60 @@ class LivePortfolio:
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "execution_date"] = execution_date
         self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "status"] = "active"
         self.save()
-        ev = self._build_exec_event("paper" if exec_type == "paper" else "actual",
-                                    cohort_id, execution_date, operator)
-        self._append_event(ev)
+        ev = self._build_exec_event(exec_type, cohort_id, execution_date, operator)
+        try:
+            self._append_event(ev)
+        except Exception as e:  # noqa: BLE001
+            # P1（2026-09-24 用户审计）：事件追加失败 → **回滚为 planned**，避免"active 无事件"的
+            # 不一致态（普通重试即可安全恢复）。
+            meta["execution_date"] = None
+            meta["status"] = "planned"
+            meta.pop("exec_type", None)
+            self.state["cohorts"][cohort_id] = meta
+            self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "execution_date"] = None
+            self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "status"] = "planned"
+            self.save()
+            raise RuntimeError(f"执行事件写入失败，已回滚为 planned（{e}）") from e
+        # 确认后自检：事件落盘、source_run_id 匹配、事件哈希 == 当前文件哈希
+        self._verify_exec_event(ev)
         return ev
+
+    def recover_execution(self, cohort_id: str, operator: str = "local_user",
+                          exec_type: str | None = None,
+                          execution_date: str | None = None) -> dict:
+        """恢复：cohort 为 active 但缺少对应确认事件的（历史失败窗口遗留）→ 按当前状态补写事件。"""
+        if cohort_id not in self.state["cohorts"]:
+            raise KeyError(f"cohort {cohort_id} 不存在")
+        meta = self.state["cohorts"][cohort_id]
+        if meta.get("status") != "active":
+            raise ValueError("只有 active 且缺事件的 cohort 需要恢复（planned 请直接 confirm_execution）")
+        prev = self._latest_exec_event(cohort_id)
+        if prev:
+            return {**prev, "recovered": False, "note": "已有确认事件，无需恢复"}
+        ev = self._build_exec_event(exec_type or meta.get("exec_type") or "paper",
+                                    cohort_id, execution_date or meta.get("execution_date"), operator)
+        ev["recovered_from_missing_event"] = True
+        self._append_event(ev)
+        self._verify_exec_event(ev)
+        return ev
+
+    def _verify_exec_event(self, ev: dict):
+        """确认后自检：事件已落盘、事件哈希与当前 ledger/state 一致。"""
+        found = False
+        if os.path.exists(EXECUTION_EVENTS_PATH):
+            with open(EXECUTION_EVENTS_PATH, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if json.loads(line).get("event_id") == ev["event_id"]:
+                        found = True
+                        break
+        if not found:
+            raise RuntimeError("执行事件自检失败：事件未落盘（状态已 active，请用 recover_execution 恢复）")
+        if ev.get("ledger_sha256") != _file_sha256(self.ledger_path) or \
+                ev.get("state_sha256") != _file_sha256(self.state_path):
+            raise RuntimeError("执行事件自检失败：事件中状态哈希与当前 ledger/state 不一致")
 
     def correct_execution(self, cohort_id: str, new_execution_date: str, new_exec_type: str,
                           reason: str, operator: str = "local_user") -> dict:
