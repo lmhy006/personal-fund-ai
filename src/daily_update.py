@@ -46,6 +46,22 @@ def fetch_daily() -> tuple:
     return df.set_index("基金代码"), dates
 
 
+def _empty(v) -> bool:
+    """空值统一判定：NaN/None/**空字符串**都视为无数据。
+
+    2026-09-28 实测：东财接口对停更基金返回**空字符串 ''**（pd.isna('') 为 False，
+    旧代码把空行写入缓存 → clean_nav 删该日，P0 同类问题）。
+    """
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    try:
+        return bool(pd.isna(v))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
                      catch_up: bool = False, auto_catchup_max: int = 50,
                      sleep_sec: float = 1.5) -> dict:
@@ -90,7 +106,8 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
         #   而不是直接追 latest=9-23（否则序列断缝）。
         avail = prev if (prev is not None and last < pd.Timestamp(prev)) else latest
         nav_new = row.get(f"{avail}-单位净值")
-        if pd.isna(nav_new):
+        if _empty(nav_new):
+            # （空串也算无数据：东财对停更基金返回 ''，pd.isna('') 为 False——2026-09-28 实测 002224）
             stat["nodata"] += 1
             continue
         # 缝隙区判定：缓存末日期与可补交易日 avail 是否**相邻交易日**（基准日历）。
@@ -123,7 +140,7 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
         #   → **不追加**，该基金列入 catch-up（逐基金完整历史重拉，官方历史含正确增长率）。
         if avail != latest:
             ret_col = f"{avail}-日增长率"
-            if ret_col not in row.index or pd.isna(row.get(ret_col)):
+            if ret_col not in row.index or _empty(row.get(ret_col)):
                 stat["gap"] += 1
                 stat["no_growth_prev"] = stat.get("no_growth_prev", 0) + 1
                 gap_list.append((code, str(last.date()), int((pd.Timestamp(avail) - last).days),
@@ -137,6 +154,11 @@ def run_daily_update(pool: str = DEFAULT_POOL, dry_run: bool = False,
             # P0（2026-09-24 用户审计）：**latest 的官方增长率是单列 `日增长率`**——
             #   日期专属列不存在，旧代码读 `{latest}-日增长率` 得空值 → clean_nav 删该日。
             nav_ret = row.get("日增长率")
+            if _empty(nav_ret):
+                # 防御（2026-09-28 实测 002224）：停更基金接口整行空串——净值列名存在但值为 ''，
+                #   增长率同样为空 → 不写空增长率行（否则被 clean_nav 删日，P0 同类问题）。
+                stat["nodata"] += 1
+                continue
         new = pd.DataFrame([{
             "date": pd.Timestamp(avail),
             "nav": nav_new,

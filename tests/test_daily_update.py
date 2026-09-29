@@ -31,8 +31,14 @@ class TestDailyUpdateBranches(unittest.TestCase):
         self.tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml",
                                 f"_du_test_{os.getpid()}_{id(self)}")
         os.makedirs(self.tmp, exist_ok=True)
-        self._orig = {k: getattr(daily_update, k) for k in ("NAV_DIR", "DEFAULT_POOL")}
+        self._orig = {k: getattr(daily_update, k) for k in ("NAV_DIR", "DEFAULT_POOL", "RAW_DIR")}
         daily_update.NAV_DIR = self.tmp
+        daily_update.RAW_DIR = self.tmp
+        # 临时基准日历（2026-09-25 中秋休市 → 9-24 与 9-28 相邻交易日）：
+        # 覆盖三个测试用到的全部交易日；隔离基准版本，不依赖真实 data/raw/benchmark 的新旧。
+        pd.DataFrame({"date": ["2026-09-22", "2026-09-23", "2026-09-24", "2026-09-28"],
+                      "close": [4544.588, 4517.279, 4439.144, 4340.755]}) \
+            .to_csv(os.path.join(self.tmp, "benchmark_hs300.csv"), index=False)
         self.pool = os.path.join(self.tmp, "fund_code_list.csv")
         pd.DataFrame({"基金代码": ["005555"]}).to_csv(self.pool, index=False, encoding="utf-8-sig")
 
@@ -71,6 +77,24 @@ class TestDailyUpdateBranches(unittest.TestCase):
         d = pd.read_csv(os.path.join(self.tmp, "fund_005555.csv"), parse_dates=["date"])
         self.assertNotIn(pd.Timestamp("2026-09-23"), set(d["date"]))   # 不追加 prev
         self.assertEqual(stat["no_growth_prev"], 1)                    # 转入 catch-up 清单
+        self.assertEqual(stat["updated"], 0)
+
+    def test_empty_string_nav_not_appended(self):
+        """2026-09-28 实测：停更基金接口返回空字符串 '' 净值/增长率（pd.isna('')为False）——
+        不得写入空行（P0 同类：空行被 clean_nav 删日），应按无数据跳过。"""
+        _write_cache(os.path.join(self.tmp, "fund_005555.csv"), [
+            {"date": "2026-09-24", "nav": 1.5100, "日增长率": 0.6, "nav_acc": 1.71},
+        ])
+        df = pd.DataFrame({
+            "2026-09-24-单位净值": [1.51], "2026-09-28-单位净值": [""],
+            "日增长率": [""], "2026-09-28-累计净值": [""], "2026-09-24-累计净值": [1.71],
+        }, index=pd.Index(["005555"], name="基金代码"))
+        with mock.patch.object(daily_update, "fetch_daily",
+                               return_value=(df, ["2026-09-24", "2026-09-28"])):
+            stat = daily_update.run_daily_update(pool=self.pool, auto_catchup_max=0)
+        d = pd.read_csv(os.path.join(self.tmp, "fund_005555.csv"), parse_dates=["date"])
+        self.assertNotIn(pd.Timestamp("2026-09-28"), set(d["date"]))   # 不追加空行
+        self.assertEqual(stat["nodata"], 1)
         self.assertEqual(stat["updated"], 0)
 
 
