@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import paper_ledger as pl  # noqa: E402
 
 
-class TestPaperLedger(unittest.TestCase):
+class _LedgerFixture(unittest.TestCase):
+    """共享 fixture（不直接含测试方法，避免子类重复执行父类用例）。"""
+
     def setUp(self):
         self.tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml",
                                 f"_pledger_test_{os.getpid()}_{id(self)}")
@@ -36,8 +38,8 @@ class TestPaperLedger(unittest.TestCase):
                        "suspicious_jump": False} for d, n, r in rows]) \
             .to_csv(os.path.join(self.hist, f"fund_{code}.csv"), index=False)
 
-    def _inputs(self, codes, cohort="2026-09", signal="2026-09-30"):
-        proto = {"initial_nav": 1.0, "cohort_weight": 1.0, "hold_months": 6,
+    def _inputs(self, codes, cohort="2026-09", signal="2026-09-30", cohort_weight=1.0):
+        proto = {"initial_nav": 1.0, "cohort_weight": cohort_weight, "hold_months": 6,
                  "buy_fee": 0.0015, "sell_fee": 0.005, "cash_annual_rate": 0.02}
         w = 1.0 / len(codes)
         payload = {"paper_inputs_version": 1, "run_id": "RID_TEST",
@@ -52,6 +54,9 @@ class TestPaperLedger(unittest.TestCase):
 
     def _ledger(self):
         return pl.PaperLedger(self.inputs, self.hist, self.out, dryrun_dir=self.dry)
+
+class TestPaperLedger(_LedgerFixture):
+    """基础解析验证（建仓费用/份额、迟发顺延、复权估值、现金计息、不可变、事件一致性）。"""
 
     # ---- 建仓解析解 ----
     def test_open_position_analytic(self):
@@ -157,6 +162,124 @@ class TestPaperLedger(unittest.TestCase):
         fact = pl.execution_fact("2026-09", events)
         self.assertEqual(fact["execution_date"], "2026-10-09")
         self.assertEqual(fact["event_id"], "e2")
+
+
+class TestPaperLedgerHardening(_LedgerFixture):
+    """2026-10-02 二次复核的四个缺口 + 组合层口径（cohort 净值 ≠ 组合净值）。"""
+
+    def _events(self, run_id, execution_date="2026-09-30", path=None):
+        path = path or os.path.join(self.tmp, "events.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event_id": "e1", "type": "paper", "cohort": "2026-09",
+                                "execution_date": execution_date,
+                                "source_run_id": run_id}) + "\n")
+        return path
+
+    def test_source_run_id_binding(self):
+        """P1：执行事件的 source_run_id 必须与封存输入 run_id 一致。"""
+        led = self._ledger()
+        ev = self._events("OTHER_RUN")                     # 封存输入是 RID_TEST
+        with self.assertRaises(ValueError) as cm:
+            led.open_position("2026-09-30", capital=1.0, events_path=ev)
+        self.assertIn("不一致", str(cm.exception))
+        # 一致时通过
+        ev2 = self._events("RID_TEST")
+        res = led.open_position("2026-09-30", capital=1.0, events_path=ev2)
+        self.assertEqual(res["status"], "opened")
+        self.assertEqual(res["ledger"]["execution_event"]["source_run_id"], "RID_TEST")
+
+    def test_persist_false_is_pure_computation(self):
+        """P2：persist=False 不写任何文件、不要求已确认执行。"""
+        led = self._ledger()
+        res = led.open_position("2026-09-30", capital=1.0, persist=False)
+        self.assertEqual(res["status"], "computed")
+        self.assertIsNone(res["path"])
+        self.assertEqual(os.listdir(self.out) if os.path.exists(self.out) else [], [])
+        self.assertEqual(os.listdir(self.dry) if os.path.exists(self.dry) else [], [])
+
+    def test_value_rejects_nav_date_after_as_of(self):
+        """P1：成交净值日晚于估值日 → 拒绝生成完整估值（不再出现 stale_days=-1）。"""
+        self._inputs(["A00003"])                            # 执行日 9-30 无净值，10-09 才有
+        led = self._ledger()
+        payload = led.build_position("2026-09-30", capital=1.0)
+        self.assertEqual(payload["positions"][0]["nav_date"], "2026-10-09")
+        with self.assertRaises(ValueError) as cm:
+            led.value("2026-10-01", ledger=payload)
+        self.assertIn("尚未实际发生", str(cm.exception))
+        # allow_pending：标记 pending，不计入市值，且 stale_days 不为负
+        val = led.value("2026-10-01", ledger=payload, allow_pending=True)
+        self.assertEqual(val["status"], "pending")
+        self.assertEqual(len(val["pending_funds"]), 1)
+        self.assertEqual(val["market_value"], 0.0)
+        self.assertIsNone(val["positions"][0]["stale_days"])
+        with self.assertRaises(RuntimeError):
+            led.save_valuation(val)                         # pending 不得落盘
+
+    def test_valuation_immutable_and_revision(self):
+        """P1：同日估值重跑幂等；数据被改动后拒绝覆盖；显式 revision 留痕。"""
+        led = self._ledger()
+        payload = led.build_position("2026-09-30", capital=1.0)
+        val = led.value("2026-10-02", ledger=payload)
+        r1 = led.save_valuation(val)
+        self.assertEqual(r1["status"], "written")
+        r2 = led.save_valuation(led.value("2026-10-02", ledger=payload))
+        self.assertEqual(r2["status"], "existing")          # 幂等
+        # 改动净值数据 → data_hashes 变 → 内容不同 → 拒绝
+        self._fund("A00001", [("2026-09-30", 1.0, 0.0), ("2026-10-01", 1.2, 0.20),
+                              ("2026-10-02", 1.44, 0.20)])
+        led2 = self._ledger()
+        val2 = led2.value("2026-10-02", ledger=led2.build_position("2026-09-30", capital=1.0))
+        self.assertNotEqual(val["data_hashes"]["A00001"]["sha256"],
+                            val2["data_hashes"]["A00001"]["sha256"])
+        with self.assertRaises(RuntimeError) as cm:
+            led2.save_valuation(val2)
+        self.assertIn("不可变", str(cm.exception))
+        r3 = led2.save_valuation(val2, revision=True, revision_reason="净值数据更正后重算")
+        self.assertEqual(r3["status"], "revised")
+        baks = [f for f in os.listdir(self.out) if ".rev_" in f]
+        self.assertEqual(len(baks), 1)
+        with open(r3["path"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["revision"]["reason"], "净值数据更正后重算")
+
+    def test_data_hashes_recorded_per_fund(self):
+        led = self._ledger()
+        val = led.value("2026-10-02", ledger=led.build_position("2026-09-30", capital=1.0))
+        self.assertEqual(set(val["data_hashes"]), {"A00001", "A00002"})
+        self.assertEqual(val["data_hashes"]["A00001"]["last_date"], "2026-10-02")
+        self.assertEqual(len(val["data_hashes"]["A00001"]["sha256"]), 64)
+
+    def test_portfolio_value_analytic(self):
+        """组合层：建仓日无价格变化时应为 1/6×(1−0.0015) + 5/6 = 0.99975。"""
+        self._inputs(["A00001", "A00002"], cohort_weight=1 / 6)
+        led = self._ledger()
+        res = led.open_position("2026-09-30", simulate=True)     # dryrun 目录
+        pv = led.portfolio_value("2026-09-30", ledger_paths=[res["path"]],
+                                 include_simulated=True)
+        self.assertEqual(pv["n_cohorts"], 1)
+        self.assertAlmostEqual(pv["cohorts"][0]["weight"], 1 / 6, places=12)
+        self.assertAlmostEqual(pv["cohorts"][0]["cohort_nav"], 1 - 0.0015, places=12)
+        self.assertAlmostEqual(pv["cash_weight"], 5 / 6, places=12)
+        self.assertAlmostEqual(pv["portfolio_nav"], (1 / 6) * (1 - 0.0015) + 5 / 6, places=12)
+        self.assertAlmostEqual(pv["portfolio_nav"], 0.99975, places=12)
+
+    def test_portfolio_value_excludes_unopened_cohort(self):
+        self._inputs(["A00001", "A00002"], cohort_weight=1 / 6)
+        led = self._ledger()
+        res = led.open_position("2026-09-30", simulate=True)
+        pv = led.portfolio_value("2026-09-30", ledger_paths=[res["path"]],
+                                 include_simulated=True)   # 同日：已建仓 → 计入
+        self.assertEqual(pv["n_cohorts"], 1)
+        # 模拟"该 cohort 的执行日晚于估值日" → 不计入，全部为现金
+        with open(res["path"], encoding="utf-8") as f:
+            fake = json.load(f)
+        fake["execution_date"] = "2026-12-01"
+        fake_path = os.path.join(self.tmp, "paper_ledger_fake.json")
+        with open(fake_path, "w", encoding="utf-8") as f:
+            json.dump(fake, f)
+        pv2 = led.portfolio_value("2026-10-02", ledger_paths=[fake_path],
+                                  include_simulated=True)
+        self.assertEqual(pv2["n_cohorts"], 0)
+        self.assertAlmostEqual(pv2["portfolio_nav"], 1.0, places=12)
 
 
 if __name__ == "__main__":

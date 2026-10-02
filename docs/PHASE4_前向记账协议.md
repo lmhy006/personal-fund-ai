@@ -37,27 +37,56 @@
 - 即使账本已算出净值曲线，`ml/ledger/portfolio_state.json` 里的 `cash_weight`/`target_weights` 仍只是
   **目标权重**；任何"前向收益"结论都须等成熟样本门槛（第 4 节），并显式标注账本口径与历史口径的差异。
 
-### 账本用法（最小实现）
+### 账本用法（最小实现，2026-10-02 加固后）
 
 ```bash
-# 10-8 确认执行后建仓（要求已存在执行确认事件，且日期与事件一致）
+# 10-8 确认执行后建仓（要求已存在执行确认事件，且日期与事件**来源 run_id** 一致）
 python src/paper_ledger.py --open --execution-date 2026-10-08
-# 任意估值日（官方日增长率复权累计 + 现金计息；迟发按最后可用净值并记 stale_days）
-python src/paper_ledger.py --value 2026-10-09
+# 纯计算（不写盘、不要求确认；诊断/试算用）
+python src/paper_ledger.py --open --execution-date 2026-10-08 --no-save
 # 预演（不要求确认，写 ml/paper/dryrun/ 并标 simulated）
 python src/paper_ledger.py --open --execution-date 2026-09-30 --dry-run
+# cohort 估值（官方日增长率复权累计 + 现金计息；迟发记 stale_days）
+python src/paper_ledger.py --value 2026-10-09
+# 组合层汇总（Σ cohort_nav×权重 + 未投资现金计息，不写盘）
+python src/paper_ledger.py --portfolio 2026-10-09
+# 估值修订（默认拒绝覆盖不同内容；确需修订才用，会备份旧版并记录原因）
+python src/paper_ledger.py --value 2026-10-09 --revision --revision-reason "净值数据更正后重算"
 ```
 
 产物：`ml/paper/ledgers/paper_ledger_{cohort}.json`（建仓明细：金额/申购费/净申购额/份额/成交净值/
-迟发 lag_days）、`ml/paper/ledgers/valuation_{cohort}_{as_of}.json`（逐只市值、复权因子、最后净值日、
-现金计息、组合净值）。账本不可变：相同内容重复写入返回 `existing`，内容不同则拒绝并需人工核对。
+迟发 lag_days/执行事件来源）、`ml/paper/ledgers/valuation_{cohort}_{as_of}.json`（逐只市值、复权因子、
+最后净值日、**数据指纹 data_hashes**、现金计息、cohort 净值）。修订版本备份为 `*.rev_{n}`。
 
-**已实现的解析自检**（测试 `tests/test_paper_ledger.py`）：申购费扣法与份额解析解、迟发顺延与
-`lag_days`、复权因子 = Π(1+daily_ret)、现金计息 `(1+r/365)^days`、未确认执行拒绝、事件折叠最终事实。
-真实数据预演（`--dry-run` 建仓 9-30）组合净值 = 0.998500 = 1 − 0.15%，与解析解一致。
+**不可变与可核验**（2026-10-02 加固）：
+- 账本/估值相同内容重跑幂等返回 `existing`；**内容不同拒绝覆盖**——包括"净值数据被改动"引起的差异
+  （每份估值内记录逐基金净值文件 sha256 + 最后净值日）；
+- 建仓**绑定来源**：执行事件的 `source_run_id` 必须等于封存输入的 `run_id`，不得拿别的 run 的封存输入建仓；
+- **待定估值**：若某基金成交净值日**晚于**估值日（建仓尚未发生），默认拒绝出估值；`allow_pending=True`
+  只用于诊断并标 `status=pending`，不会出现 `stale_days=-1`，也不得落盘为完成估值。
 
-**尚未实现**：到期赎回流程（2027-03 首批到期前完成）、组合层 5/6 现金的汇总计息、与历史等权口径的
-分列对账表。
+**已实现的解析自检**（`tests/test_paper_ledger.py`，16 项）：申购费扣法与份额解析解、迟发顺延与
+`lag_days`、复权因子 = Π(1+daily_ret)、现金计息 `(1+r/365)^days`、来源绑定、纯计算路径、待定拒绝、
+估值不可变与显式修订、数据指纹、组合层 0.99975 解析解。真实数据预演（`--dry-run` 建仓 9-30）
+cohort 净值 = 0.998500 = 1 − 0.15%，与解析解一致。
+
+**尚未实现**：到期赎回流程与赎回费计提（2027-03 首批到期前完成）、多 cohort 现金的逐段计息、
+与历史等权口径的分列对账表。
+
+## 3.1 口径：cohort 净值 ≠ 组合净值（2026-10-02 用户指正）
+
+- **cohort 净值**（`value()` 的 `cohort_nav`）：以**该 cohort 的资本**（1/6）为分母，起点 1.0；
+  建仓日无价格变化时 = `1 − buy_fee` = **0.9985**。此前代码与输出把它称为"组合净值"，是**错误**的。
+- **组合净值**（`portfolio_value()` 的 `portfolio_nav`）：`Σ(cohort_nav × cohort_weight) + 未投资现金计息`。
+  单 cohort、建仓日无价格变化、尚无利息时：
+
+  \[
+  \frac16(1-0.0015)+\frac56 = \mathbf{0.999750}
+  \]
+
+  即"申购费只作用在建仓的那 1/6 上，另外 5/6 仍是现金"。当前阶段（仅 2026-09 一个 cohort）
+  组合净值 ≈ cohort 净值 × 1/6 + 5/6，**两者相差很大，不可混用**。
+- 现金计息：2%/年 actual-365 日复利；本期以**最早建仓日**为起点（多 cohort 逐段计息待后续）。
 
 ## 4. 首次前向复核时间点（沿用既定计划）
 

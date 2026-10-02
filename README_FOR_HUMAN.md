@@ -7,7 +7,7 @@
 - **最新正式快照**：`ml/snapshots/20260930_233855` —— `signal_date=2026-09-30`、`signal_mode=month_end`、`status=complete`（有 `COMPLETE`）、`score_run==run_id`；月末门禁通过（`stale_n=0`、processed 中位=2026-09-30、gap 例外逐只备案）。
 - **当前组合**：2026-09 cohort 为 **planned**（50 只等权、目标权重 1/6、目标现金 5/6、到期 2027-03），无 active cohort；**等待 10-8 人工 paper 确认**（10-1~10-7 休市，10-8 恢复交易）。
 - **首次记账输入已封存**：`ml/paper/paper_inputs_20260930_233855.json`（协议参数 + Top50 + 逐只权重 + 全部哈希）与 `ml/paper/main_universe_2026-09-30.csv`（4920 只 main 全池对照基准）；封存物不可变。
-- **最小账本已实现**（`src/paper_ledger.py`）：份额级建仓 + 官方日增长率复权估值 + 现金计息 + 净值迟发 lag；**只为已确认的执行建仓**。⚠️ **账本尚未产生任何前向绩效**——不得把 active 状态当成绩效验证（口径与边界见 `docs/PHASE4_前向记账协议.md`）。
+- **最小账本已实现**（`src/paper_ledger.py`）：份额级建仓 + 官方日增长率复权估值 + 现金计息 + 净值迟发 lag；**只为已确认的执行建仓**，并绑定执行事件的 `source_run_id`；估值不可变（不同内容拒绝覆盖，显式 `--revision` 才可修订并留痕），待定（成交净值日晚于估值日）拒绝出估值。⚠️ **账本尚未产生任何前向绩效**——不得把 active 状态当成绩效验证（口径与边界见 `docs/PHASE4_前向记账协议.md`）。**口径注意**：`--value` 输出的是 **cohort 净值**（分母=该 cohort 资本 1/6，建仓日 0.9985）；**组合净值**由 `--portfolio` 汇总（`Σ cohort_nav×权重 + 未投资现金计息`，建仓日 = 0.999750）——两者不可混用。
 - **当前数据状态**：raw/processed 到 2026-09-30；`gap_n=5`（停更未清盘）**已逐只备案**（`ml/calendar/gap_exceptions.json`）；166007 因接口迟发落后 9-30 一个交易日（`stale_n=1`）——此刻重跑 9-30 月末门禁会**按设计中止**，需先补齐。
 - **生产隔离与失败恢复已收尾**：test/skip 运行不触碰正式评分/台账（评分与影子写隔离目录）；重建/非前向来源在查询与确认两端都被拒绝；快照失败后台账字节级回滚 + `NOT_COMPLETE_ABORTED`；快照完整性链（`files.json`+`manifest_sha256`）+ 输入留痕 + 运行锁；`verify_snapshot()` 可校验。
 - **测试**：`python -m unittest discover -s tests` → **92 项通过**。
