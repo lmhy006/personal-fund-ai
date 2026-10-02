@@ -252,14 +252,19 @@ def _is_month_end(ts: pd.Timestamp) -> bool:
     return ts.date() == last_date.date()
 
 
-def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp):
-    """月末正式运行前置门禁（2026-09-24 用户审计 P1）：
+def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp) -> dict:
+    """月末正式运行前置门禁（2026-09-24 审计 P1 + 2026-10-02 审计第 5 节）：
 
     data_health=PASS 只说明无 FAIL 项——processed 中位可落后 raw 最多 3 天、stale 只计 WARN，
     若 9-30 多数净值只到 9-29 仍可能按 9-30 基准生成 COMPLETE。因此 month_end 运行额外要求：
       ① 现存池 stale_n == 0（净值全部追平评分日）；
-      ② processed 中位日期 == 评分日（净值主体已到）。
-    不满足 → 中止（等净值完整披露或先 --catch-up），绝不生成"假月末"正式快照。
+      ② processed 中位日期 == 评分日（净值主体已到）；
+      ③ **gap 逐只备案**（2026-10-02）：凡被判为 gap 的基金必须在
+         ml/calendar/gap_exceptions.json 有备案且末日一致——未备案/末日漂移一律中止，
+         未知缺口不得由总量阈值（gap_n>50）自动放行。
+    不满足 → 中止（等净值完整披露、先 --catch-up、或登记例外后重跑）。
+
+    :return: 月末核验证据（写入 manifest.month_end_data_ready，含口径与例外清单）
     """
     stale_n = health.get("stale_n") or 0
     if stale_n > 0:
@@ -272,6 +277,33 @@ def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp):
         raise RuntimeError(
             f"月末门禁：processed 中位日期 {pd.Timestamp(med).date()} ≠ 评分日 "
             f"{data_cutoff.date()}——净值主体未到评分日，禁止生成月末正式快照")
+
+    gap_n = health.get("gap_n")
+    gaps = health.get("gap_funds")
+    gap_check = None
+    if (gap_n or 0) > 0:
+        if gaps is None:
+            raise RuntimeError(
+                f"月末门禁：gap_n={gap_n} 但 health 报告缺 gap 明细（gap_funds）——无法逐只核销"
+                f"例外，禁止正式运行（请升级 data_health 后重跑）")
+        from gap_exceptions import coverage
+        gap_check = coverage(str(data_cutoff.date()), gaps)
+        if gap_check["missing"]:
+            detail = "; ".join(f"{m['fund_code']}（{m.get('why')}）"
+                               for m in gap_check["missing"][:5])
+            raise RuntimeError(
+                f"月末门禁：{len(gap_check['missing'])} 只 gap 基金未备案或末日已变化——{detail}"
+                f"；请在 ml/calendar/gap_exceptions.json 逐只登记"
+                f"（原因/证据/批准人/失效条件）后重跑")
+    return {
+        "signal_mode": "month_end", "signal_date": str(data_cutoff.date()),
+        "stale_n": stale_n, "gap_n": gap_n,
+        "processed_median": str(med) if med is not None else None,
+        "benchmark_stale_basis": health.get("benchmark_stale_basis"),
+        "criteria": "stale_n==0 且 processed_dist.median==data_cutoff 且 gap 基金逐只已备案"
+                    "（检查见 production_pipeline._check_month_end_data_ready）",
+        "gap_exceptions": gap_check,
+    }
 
 
 # ---------------------------------------------------------------- 正式台账事务边界
@@ -461,9 +493,10 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
 
     # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
     month_end = _is_month_end(data_cutoff)
+    month_end_data_ready = None
     if month_end and not is_test:
-        # P1（2026-09-24）：月末正式运行前必须**净值齐全**（stale==0 且 processed 中位==评分日）
-        _check_month_end_data_ready(health, data_cutoff)
+        # P1（2026-09-24）+ 第 5 节（2026-10-02）：净值齐全门禁 + gap 基金逐只备案核销
+        month_end_data_ready = _check_month_end_data_ready(health, data_cutoff)
     elif month_end and is_test:
         log("  （诊断运行：跳过月末门禁的强中止语义，但 ledger 不推进）")
     # P0（2026-10-02 复核）：正式路径的事务边界——先备份运行前的正式台账，
@@ -491,15 +524,8 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         "processed_dist": health.get("processed_dist"),
         "stale_n": health.get("stale_n"),
         "gap_n": health.get("gap_n"),
-        # 月末核验记录（P1 2026-09-24）：month_end 正式运行要求 stale_n==0 且
-        # processed_dist.median == data_cutoff（_check_month_end_data_ready 强制，不满足即中止）；
-        # 该组字段让快照 manifest 自带"月末净值齐全"证据，事后可复核。
-        "month_end_data_ready": None if not month_end else {
-            "signal_mode": "month_end", "stale_n": health.get("stale_n"),
-            "gap_n": health.get("gap_n"),
-            "processed_median": str((health.get("processed_dist") or {}).get("median")),
-            "criteria": "stale_n==0 且 processed_dist.median==data_cutoff（检查见 "
-                        "production_pipeline._check_month_end_data_ready）"},
+        # 月末核验记录（P1 2026-09-24；2026-10-02 增加 gap 逐只备案核销证据）
+        "month_end_data_ready": month_end_data_ready,
         "factor_cutoff": health.get("shadow_factors"),
         "signal_date": str(data_cutoff.date()),
         "signal_mode": "month_end" if month_end else "observation",   # 月末信号门禁（前向运行期）

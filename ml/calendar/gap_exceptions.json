@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "purpose": "月末 gap 例外备案：month_end 正式运行要求每只被判为 gap 的现存池基金都已逐只备案（原因/证据/批准人/失效条件），未备案或末日不一致一律中止——未知缺口不得由总量阈值自动放行（2026-10-02 审计第 5 节）。",
+  "entries": {
+    "2026-09": {
+      "signal_date": "2026-09-30",
+      "recorded_at": "2026-10-02T00:00:00",
+      "approved_by": "local_user（依据 docs/PHASE4_2026-09_月末放行例外.md 人工核销）",
+      "note": "对应正式快照 20260930_233855 的 data_health.gap_n=7（该快照生成于 gap_funds 明细字段引入之前，末日为本审计现场核对的 raw 末行）。",
+      "funds": {
+        "002213": {
+          "last_date": "2026-09-28",
+          "lag_trading_days": 2,
+          "reason": "净值迟发：daily 接口缺该基金数据，全历史接口可用",
+          "evidence": "2026-10-02 重拉追平至 2026-09-30；不在当日 Top50，不影响本次选股",
+          "expires_when": "已追平，本次备案即时失效；后续月末运行按新数据重新判定"
+        },
+        "166007": {
+          "last_date": "2026-09-28",
+          "lag_trading_days": 2,
+          "reason": "净值迟发：官方历史亦止于 2026-09-29（差 9-30 一日）",
+          "evidence": "2026-10-02 重拉后到 2026-09-29；不在当日 Top50",
+          "expires_when": "接口补披露 9-30 后失效（daily_update 会自动追平）"
+        },
+        "002224": {
+          "last_date": "2026-09-24",
+          "lag_trading_days": 3,
+          "reason": "停更未清盘：接口对该基金返回空字符串，官方历史不再更新",
+          "evidence": "多次全历史重拉仍止于 9-24；不在当日 Top50",
+          "expires_when": "官方恢复披露即失效"
+        },
+        "018975": {
+          "last_date": "2026-09-24",
+          "lag_trading_days": 3,
+          "reason": "停更未清盘：接口无新净值",
+          "evidence": "全历史重拉仍止于 9-24；不在当日 Top50",
+          "expires_when": "官方恢复披露即失效"
+        },
+        "018539": {
+          "last_date": "2026-09-22",
+          "lag_trading_days": 5,
+          "reason": "停更未清盘：接口无新净值",
+          "evidence": "全历史重拉仅到 9-22；不在当日 Top50",
+          "expires_when": "官方恢复披露即失效"
+        },
+        "002614": {
+          "last_date": "2026-09-21",
+          "lag_trading_days": 6,
+          "reason": "停更未清盘：接口无新净值",
+          "evidence": "全历史重拉仍止于 9-21；不在当日 Top50",
+          "expires_when": "官方恢复披露即失效"
+        },
+        "004772": {
+          "last_date": "2026-09-18",
+          "lag_trading_days": 7,
+          "reason": "停更未清盘：接口无新净值",
+          "evidence": "全历史重拉仍止于 9-18；不在当日 Top50",
+          "expires_when": "官方恢复披露即失效"
+        }
+      }
+    }
+  }
+}

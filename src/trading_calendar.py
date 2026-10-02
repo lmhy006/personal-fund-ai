@@ -4,9 +4,9 @@
 #   于是 10-1（国庆休市）与 10-10（周六）都会被接受；基准 CSV 又止于 9-30，无法覆盖
 #   10-8 之后的执行日。因此引入一份**显式、版本化、可追溯来源**的交易日历：
 #     - 基准日历（benchmark_hs300.csv）是历史交易日的权威来源（有行情即有交易）；
-#     - 未来已知交易日/休市日由人工按交易所公告登记为 override/holiday（含来源与登记时间）；
-#     - **覆盖范围之外且未登记的日期 → 直接拒绝**（UnknownTradingDayError），
-#       绝不"猜"某个未来日期是否为交易日。
+#     - 长假与临时休市按交易所公告登记为 holidays；个别需要显式说明的交易日登记为 overrides；
+#     - 基准日历之后的**覆盖范围内工作日默认开市**（宽松于逐日登记，避免节后每天都要登记），
+#       但日历的 holiday 登记仍优先；超出 coverage_end 或早于基准起点 → 直接拒绝，不猜。
 # 日历文件改动即为版本变更（calendar_version 递增），确认事件里记录所依据的版本与判定来源。
 import json
 import os
@@ -73,11 +73,16 @@ def describe_trading_day(d, calendar_path: str = CALENDAR_PATH,
                 "source": ("基准日历命中（有沪深300行情）" if hit else "基准日历范围内缺失（非交易日）"),
                 "calendar_version": ver}
 
-    # 超出基准日历覆盖范围：必须有显式登记，否则拒绝（不猜未来交易日）
+    # 超出基准日历（未来日期）：**覆盖范围内的工作日按交易所安排默认开市**——长假与临时休市
+    # 一律登记在 holidays/overrides 里；超出 coverage_end 则拒绝判定（不猜）。
     coverage_end = cal.get("coverage_end")
+    if coverage_end and ts <= pd.Timestamp(coverage_end).normalize():
+        return {"date": key, "is_trading_day": True,
+                "source": f"覆盖范围内工作日（默认开市；节假日/休市须在日历登记，版本 {ver}）",
+                "calendar_version": ver}
     raise UnknownTradingDayError(
         f"{key} 超出基准日历覆盖（{bc.max().date() if len(bc) else '?'}）"
-        f"{f'，且在日历 coverage_end={coverage_end} 内未登记' if coverage_end else ''}"
+        f"{f'与日历 coverage_end={coverage_end}' if coverage_end else ''}"
         f"——请按交易所公告在 {calendar_path} 登记后再确认（当前日历版本 {ver}）")
 
 

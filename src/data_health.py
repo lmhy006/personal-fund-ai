@@ -21,7 +21,7 @@ import argparse
 import glob
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, time as _time, timedelta
 
 import numpy as np
 import pandas as pd
@@ -39,8 +39,37 @@ STYLE_INDEX_FILES = ["style_index_sh000905.csv", "style_index_sz399006.csv"]
 # 原实现误查 data/raw/sw_industry/ 目录，31 个行业文件从未进入 stale 判定）
 SW_GLOB = os.path.join(RAW_DIR, "sw_industry_*.csv")
 STALE_GAP_FAIL_N = 50      # raw 中 gap（落后 ≥2 交易日）基金数超过该值 → FAIL（对齐 daily_update 自动补齐阈值）
-BENCH_MAX_AGE_DAYS = 7     # benchmark 落后现状超过该值 → FAIL
+BENCH_MAX_AGE_DAYS = 7     # benchmark 落后现状超过该值 → FAIL（**仅在交易日历无法判定时**退回的自然日口径）
+BENCH_MAX_STALE_TRADING_DAYS = 3   # benchmark 之后已结束的交易日数超过该值 → FAIL（交易日口径，主判据）
+DISCLOSE_AFTER = _time(20, 0)      # 当日净值/行情披露时点近似：此前不计入"今天已完成"
 PROC_LAG_OK_DAYS = 3       # processed 落后 raw/benchmark 的容许天数
+
+
+def benchmark_stale_trading_days(bench_date: pd.Timestamp,
+                                 now: datetime | None = None) -> int | None:
+    """基准最新日之后**已经结束**的交易日数量（版本化日历口径）；无法判定返回 None。
+
+    为什么用交易日（2026-10-02 审计第 5 节）：原判据是自然日 >7，长假（如 10-1~10-7 休市）
+    之后 10-8 早上"最近已完成交易日"仍是 9-30，自然日差 8 天 → 误判 FAIL，把 Agent 查询挡住。
+    交易日口径下长假后为 0（正常）；只有真的连续多个交易日未更新基准才 FAIL。
+    当日披露时点（`DISCLOSE_AFTER`，默认 20:00）之前不计入"今天已完成"。
+    """
+    from trading_calendar import UnknownTradingDayError, is_trading_day
+    now = now or datetime.now()
+    end = now.date() if now.time() >= DISCLOSE_AFTER else now.date() - timedelta(days=1)
+    start = pd.Timestamp(bench_date).date()
+    if end <= start:
+        return 0
+    n = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        try:
+            if is_trading_day(d):
+                n += 1
+        except UnknownTradingDayError:
+            return None            # 日历覆盖不足 → 交由调用方退回自然日口径
+        d += timedelta(days=1)
+    return n
 
 
 def latest_date_csv(path_col, path):
@@ -167,9 +196,19 @@ def check(report: dict) -> str:
     if bench is None:
         fails.append("benchmark 缺失")
     else:
-        age = (datetime.now() - bench.to_pydatetime()).days
-        if age > BENCH_MAX_AGE_DAYS:
-            fails.append(f"benchmark 过旧（{bench.date()}，距今天 {age} 天）")
+        stale_td = benchmark_stale_trading_days(bench)
+        if stale_td is None:
+            # 交易日历覆盖不足 → 退回自然日口径（保守），并显式记录所用口径
+            age = (datetime.now() - bench.to_pydatetime()).days
+            report["benchmark_stale_basis"] = f"calendar_days:{age}（日历无法判定，退回自然日）"
+            if age > BENCH_MAX_AGE_DAYS:
+                fails.append(f"benchmark 过旧（{bench.date()}，距今天 {age} 自然日）")
+        else:
+            report["benchmark_stale_basis"] = f"trading_days:{stale_td}"
+            if stale_td > BENCH_MAX_STALE_TRADING_DAYS:
+                fails.append(
+                    f"benchmark 过旧：最新基准日 {bench.date()}，其后已结束 {stale_td} 个交易日未更新"
+                    f"（阈值 {BENCH_MAX_STALE_TRADING_DAYS} 个交易日）")
     raw_l = report["raw_latest"]
     proc = report.get("processed_dist")
     if proc is None or raw_l is None:
@@ -195,6 +234,9 @@ def check(report: dict) -> str:
         report["shadow_stale"] = stale_fac
         if stale_fac:
             warns.append("shadow 因子 stale（影子评分应跳过）")
+    # 2026-10-02 审计（健康诊断可读性）：把具体原因写进报告，便于人工核销与恢复
+    report["fails"] = fails
+    report["warns"] = warns
     return "FAIL" if fails else ("WARN" if warns else "PASS")
 
 
@@ -205,6 +247,7 @@ def health_report() -> dict:
 
     # stale / gap（相对 benchmark）——**只对现存池**（清盘基金净值本就停止，不算缺口）
     stale_n = gap_n = None
+    gap_funds = []                      # 2026-10-02 审计：gap 明细（供月末例外备案核销）
     alive_codes = None
     idx_path = os.path.join(PROJECT_ROOT, "data", "processed", "fund_history_index.csv")
     if os.path.exists(idx_path):
@@ -239,6 +282,9 @@ def health_report() -> dict:
                 lag_td = len(bench_dt_arr) - 1 - pos
                 if lag_td >= 2:
                     gap_n += 1
+                    gap_funds.append({"fund_code": code,
+                                      "last_date": str(pd.Timestamp(d).date()),
+                                      "lag_trading_days": int(lag_td)})
                 elif lag_td == 1:
                     stale_n += 1
 
@@ -252,6 +298,7 @@ def health_report() -> dict:
         "processed_latest_date": (str(proc_date["median"]) if proc_date else None),  # 以中位数为代表
         "processed_funds": proc_n,
         "stale_n": stale_n, "gap_n": gap_n, "gap_scope": "alive 现存池，交易日口径（gap=落后≥2交易日）",
+        "gap_funds": sorted(gap_funds, key=lambda x: (-x["lag_trading_days"], x["fund_code"])),
         "catchup": "见最近 pipeline manifest（data_health 独立运行不拉取）",
         "shadow_factors": shadow_factor_dates(),
         "last_scores": last_scores_counts(),
