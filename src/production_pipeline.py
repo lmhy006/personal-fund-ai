@@ -207,7 +207,13 @@ def step_shadow_factors() -> dict:
     return res
 
 
-def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
+def step_shadow_score(health: dict, data_cutoff: pd.Timestamp,
+                      persist: bool = True, run_id: str | None = None) -> tuple | None:
+    """影子评分（两条中性化影子，仅记录不参与资金决策）。
+
+    P0（2026-10-02 用户复核）：`persist=False`（诊断/test 运行）时影子输出同样**不得覆盖正式
+    `ml/scores/shadow_*.csv`**（旧实现只在主评分上做了隔离），改写隔离目录 `ml/scores_test/`。
+    """
     log("步骤6/8 shadow_score（两条中性化影子，仅记录不参与资金决策）…")
     # P1（2026-09-23 审查）：新鲜度判定**只用刷新后重跑的 data_health.shadow_stale**
     #   （data_health 严格按"因子最新日 < benchmark"判定，无临时自然日容差）。
@@ -218,8 +224,14 @@ def step_shadow_score(health: dict, data_cutoff: pd.Timestamp) -> tuple | None:
         return None, stale
     from shadow_score import shadow_scores
     sh, main, t_date = shadow_scores()
-    os.makedirs(SCORES_DIR, exist_ok=True)
-    path = os.path.join(SCORES_DIR, f"shadow_{t_date.strftime('%Y-%m')}.csv")
+    if persist:
+        os.makedirs(SCORES_DIR, exist_ok=True)
+        path = os.path.join(SCORES_DIR, f"shadow_{t_date.strftime('%Y-%m')}.csv")
+    else:
+        test_dir = os.path.join(PROJECT_ROOT, "ml", "scores_test")
+        os.makedirs(test_dir, exist_ok=True)
+        path = os.path.join(test_dir, f"{run_id or 'run'}_shadow_{t_date.strftime('%Y-%m')}.csv")
+        log("  （诊断运行：影子评分写入隔离目录 ml/scores_test/，**不覆盖**正式影子文件）")
     sh.to_csv(path, index=False)
     log(f"  影子评分已落盘 {path}（{len(sh)} 只）")
     return path, None
@@ -262,19 +274,75 @@ def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp):
             f"{data_cutoff.date()}——净值主体未到评分日，禁止生成月末正式快照")
 
 
+# ---------------------------------------------------------------- 正式台账事务边界
+def _official_ledger_paths() -> tuple:
+    """运行时解析正式 ledger/state 路径（测试可 monkeypatch live_portfolio 模块常量）。"""
+    from live_portfolio import LEDGER_PATH, STATE_PATH
+    return LEDGER_PATH, STATE_PATH
+
+
+def backup_official_ledger() -> dict:
+    """P0（2026-10-02 用户复核）：快照失败恢复用——读正式 ledger/state 的**原始字节**。
+
+    背景：旧流程先推进正式 planned 台账（`score_run` 指向本次 run_id），随后才写快照；
+    若快照写入失败，就留下"台账来源指向一个没有 COMPLETE 的 run"的不一致态，
+    使下一次确认被"来源不完整"校验拒绝。
+    """
+    lp_path, st_path = _official_ledger_paths()
+
+    def _read(p):
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read()
+
+    return {"ledger_path": lp_path, "state_path": st_path,
+            "ledger_bytes": _read(lp_path), "state_bytes": _read(st_path)}
+
+
+def restore_official_ledger(bak: dict):
+    """把正式 ledger/state 还原为备份字节（临时文件 + 原子替换）。"""
+    for key, path in (("ledger_bytes", bak["ledger_path"]), ("state_bytes", bak["state_path"])):
+        data = bak.get(key)
+        if data is None:
+            if os.path.exists(path):
+                os.remove(path)
+            continue
+        tmp = path + ".restore.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    log(f"  已回滚正式台账到运行前版本：{bak['ledger_path']}、{bak['state_path']}")
+
+
+def mark_aborted_snapshot(run_id: str, reason: str):
+    """快照写入失败时，把已创建但不完整的目录显式标记为非正式（绝不冒充 COMPLETE）。"""
+    snap = os.path.join(SNAPSHOTS_DIR, run_id)
+    if os.path.isdir(snap) and not os.path.exists(os.path.join(snap, "COMPLETE")):
+        with open(os.path.join(snap, "NOT_COMPLETE_ABORTED"), "w", encoding="utf-8") as f:
+            f.write(f"{run_id} aborted_at={datetime.now().isoformat(timespec='seconds')}\n"
+                    f"原因：{reason}\n"
+                    f"该目录不是正式前向快照，不得用于执行确认或绩效取证。\n")
+        log(f"  已标记未完成快照：{snap}/NOT_COMPLETE_ABORTED")
+
+
 def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str,
-                   month_end: bool = True, persist: bool = True):
+                   month_end: bool = True, persist: bool = True,
+                   ledger_path: str | None = None, state_path: str | None = None):
     """月末正式运行 → 推进 6-cohort ledger（score_run=run_id）；月中观察 → 不推进。
 
     P0-2（2026-10-02 审计）：`persist=False`（诊断/test 运行）时用**纯计算路径**——
     只在内存里算本月动作供 manifest 记录，**不写盘、不改正式 ledger/state**。
     旧实现先推进正式 planned 选股与 score_run，再决定本次是 test，导致诊断运行把来源
     改成没有 COMPLETE 的测试 run，随后的正式确认反被"来源不完整"校验拒绝。
+
+    `ledger_path`/`state_path`：None 哨兵，运行时解析 live_portfolio 模块常量
+    （便于测试与故障恢复隔离）。
     """
     mode = "month_end" if month_end else "observation"
     log(f"步骤7/8 live_portfolio（{mode}；score_run={run_id}；persist={persist}）…")
-    from live_portfolio import LivePortfolio
-    pf = LivePortfolio()
+    from live_portfolio import LEDGER_PATH as _LP, STATE_PATH as _SP, LivePortfolio
+    pf = LivePortfolio(ledger_path=ledger_path or _LP, state_path=state_path or _SP)
     if month_end and persist:
         action = pf.add_month(scores_df, score_run=run_id)
     elif month_end:
@@ -388,7 +456,8 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         as_of_ts, persist=not is_test, run_id=run_id)
     data_cutoff = t_date
 
-    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
+    shadow_path, shadow_stale = step_shadow_score(health, data_cutoff,
+                                                  persist=not is_test, run_id=run_id)
 
     # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
     month_end = _is_month_end(data_cutoff)
@@ -397,6 +466,9 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         _check_month_end_data_ready(health, data_cutoff)
     elif month_end and is_test:
         log("  （诊断运行：跳过月末门禁的强中止语义，但 ledger 不推进）")
+    # P0（2026-10-02 复核）：正式路径的事务边界——先备份运行前的正式台账，
+    #   若后面的快照写入失败，则回滚台账并标记未完成来源（不留"新 score_run 无 COMPLETE"）。
+    ledger_backup = None if is_test else backup_official_ledger()
     pf, action, agg = step_portfolio(scores_df, t_date, run_id, month_end, persist=not is_test)
 
     main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
@@ -448,8 +520,15 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
     }
     snapshot_mode = "test" if (skip_refresh or skip_clean) else \
         ("complete" if month_end else "observation")
-    snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
-                         mode=snapshot_mode, shadow_factor_refresh=factor_refresh)
+    try:
+        snap = step_snapshot(run_id, manifest, scores_path, shadow_path, health, pf, action, agg, top50,
+                             mode=snapshot_mode, shadow_factor_refresh=factor_refresh)
+    except Exception as e:  # noqa: BLE001
+        # P0（2026-10-02 复核）：快照失败 → 正式台账回到运行前完整版本 + 标记未完成来源
+        if ledger_backup is not None:
+            restore_official_ledger(ledger_backup)
+        mark_aborted_snapshot(run_id, f"快照写入失败：{e}")
+        raise
     with open(os.path.join(LOG_DIR, "production_pipeline_latest.txt"), "w", encoding="utf-8") as f:
         f.write(json.dumps(manifest, ensure_ascii=False, indent=2, default=str) + "\n")
     if manifest["status"] == "complete":

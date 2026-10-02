@@ -516,6 +516,18 @@ class LivePortfolio:
                 f"来源快照 signal_date（{mf.get('signal_date')}）与 cohort.signal_date"
                 f"（{meta.get('signal_date')}）不一致——计划与来源漂移，拒绝确认")
 
+        # P0（2026-10-02 用户复核）：**事后重建/非前向样本不得用作确认依据**。
+        # 旧实现的校验只看 COMPLETE 标志，导致 `is_reconstruction=true / forward_eligible=false`
+        # 的临时快照也能被用来确认执行。字段缺失的旧快照（本字段引入前生成）按"非重建"处理。
+        if mf.get("is_reconstruction") or mf.get("forward_eligible") is False:
+            raise ValueError(
+                f"来源快照 run_id={src} 标记为事后重建/非前向样本"
+                f"（is_reconstruction={mf.get('is_reconstruction')!r}, "
+                f"forward_eligible={mf.get('forward_eligible')!r}）——不能作为执行确认依据")
+        if mf.get("run_mode") in ("test", "observation"):
+            raise ValueError(
+                f"来源快照 run_mode={mf.get('run_mode')!r} 非正式月末运行，不能用于确认执行")
+
         # 评分文件哈希（快照内副本 vs manifest 记录）
         score_hash = mf.get("score_file_sha256")
         score_name = None

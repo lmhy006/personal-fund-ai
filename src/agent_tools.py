@@ -110,6 +110,12 @@ def _complete_snapshots(snaps_dir=None):
             continue
         if man.get("status") != "complete":
             continue
+        # P0（2026-10-02 用户复核）：事后重建 / 非前向样本 / 非正式运行不得列为"正式快照"，
+        # 否则会被查询（并进一步被确认）当成前向证据。字段缺失的旧快照按正式处理（向后兼容）。
+        if man.get("is_reconstruction") or man.get("forward_eligible") is False:
+            continue
+        if man.get("run_mode") in ("test", "observation"):
+            continue
         out.append({"run_id": d, "dir": os.path.join(snaps_dir, d), "manifest": man})
     out.sort(key=lambda x: str(x["manifest"].get("score_generated_at", "")))
     return out
