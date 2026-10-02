@@ -23,6 +23,15 @@ htmlcov/
 # Phase 4 薄工具层/前向运行期测试的临时 fixture（tests/ 创建）
 ml/_agt_test_*/
 ml/_fwd_test_*/
+ml/_du_test_*/
+ml/_cf_test_*/
+ml/_cf_pipe_*/
+ml/_iso_*/
+ml/_fpi_test_*/
+ml/_pledger_test_*/
+ml/_verify_confirm_*/
+# 账本预演产物（dry-run：用模拟执行日，非真实执行留痕，不入库）
+ml/paper/dryrun/
 
 # ===================== akshare下载缓存 / 临时文件 =====================
 *.tmp
