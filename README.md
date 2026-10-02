@@ -648,6 +648,15 @@ Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/
 
 ### 三点五、前向纸面运行期（Forward Paper Run，2026-09-22 起）
 
+> **当前状态（2026-10-02，详见 `README_FOR_HUMAN.md` 文首「当前运行状态」）**：9 月末正式快照
+> `ml/snapshots/20260930_233855`（`signal_date=2026-09-30`、`signal_mode=month_end`、`COMPLETE`、
+> `score_run==run_id`、月末门禁通过）已生成；2026-09 cohort 为 **planned**（50 只、目标权重 1/6、
+> 现金 5/6），等待 **10-8** 人工 paper 确认。首次记账输入已封存（`ml/paper/paper_inputs_20260930_233855.json`、
+> `ml/paper/main_universe_2026-09-30.csv`），最小账本 `src/paper_ledger.py` 已实现（**尚未产生任何前向绩效**）。
+> 生产隔离/失败恢复已收尾：test 运行不触碰正式产物、重建来源在查询与确认两端被拒、快照失败回滚、
+> 快照完整性链 + 输入留痕 + 运行锁、gap 例外逐只备案（`ml/calendar/gap_exceptions.json`）、
+> 基准新鲜度改交易日口径（长假后不再误判）。测试 **92 项通过**。
+
 项目当前缺的不是功能，而是**真正发生在未来、未被反复查看和修改过的验证数据**。因此在 2027 年之前**不新增模型、不搜索参数、不接 LLM**，只按月稳定运行并留痕。
 
 **生产语义（三条，已实现）**
@@ -655,7 +664,7 @@ Ridge 反号已由 `src/ridge_sign_diag.py` 定点定位（逐折 `coef_`/`X'y`/
 1. **月末信号门禁**：研究策略是月末调仓，生产系统此前允许月中完整运行。现在 `production_pipeline` 判定评分日是否为**当月最后工作日**（`_is_month_end`，工作日近似；节假日未精确建模 = production limitation）：
    - `signal_mode=month_end` → 推进 6-cohort ledger（建/更新 cohort），快照写 **`COMPLETE`**；
    - `signal_mode=observation` → **月中运行只作数据与评分观察**：照常刷新数据与评分，但**不推进正式 cohort**，快照写 **`NOT_COMPLETE_OBSERVATION`**（`status=observation`），不算正式 forward 记录。
-   - 当前 2026-09 cohort 保持 `planned`，**9-21 不作为正式建仓日**；月末用最终评分更新，随后由实际可交易日 `confirm_execution` 确认。
+   - 2026-09 cohort 已由 9-30 月末正式运行更新为 `signal_date=2026-09-30` 的 `planned`（**9-21 从未作为建仓日**）；随后由实际可交易日 `confirm_execution` 确认。
 2. **影子因子自动刷新**（`style_factors.refresh_all_shadow_factors`，流水线步骤）：刷新 **2 只风格指数 + 31 只申万一级行业指数**（单线程串行）→ 以刷新结果判定新鲜度 → fresh 则生成影子评分；**刷新失败或仍 stale 则明确跳过影子并记录原因，主策略照常**。此前流水线只检查不刷新，导致"影子前向证据积累不了"。
 3. **执行事件留痕**（`live_portfolio.confirm_execution`）：每次执行确认向独立不可变 `ml/ledger/execution_events.jsonl`（append-only）写入事件——`type`（**paper**/**actual**）、`cohort`、`source_run_id`、`confirmed_at`、`execution_date`、`operator`、以及确认后 ledger/state 的 **sha256**。现阶段明确采用 **paper 纸面组合**：项目未接交易系统、也没有可靠费用后超额证据，**不得把纸面 ledger 描述成真实持仓**。
 
