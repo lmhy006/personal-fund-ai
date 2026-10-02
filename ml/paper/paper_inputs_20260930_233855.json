@@ -1,0 +1,316 @@
+{
+  "paper_inputs_version": 1,
+  "frozen_at": "2026-10-02T19:51:47",
+  "run_id": "20260930_233855",
+  "signal_date": "2026-09-30",
+  "cohort_id": "2026-09",
+  "source_snapshot": {
+    "dir": "D:\\fund_ai\\ml\\snapshots\\20260930_233855",
+    "manifest_sha256": "4ff82715cf257e45ba733cb7a94d19c72f00954224c760f51d5c3a949da157b9",
+    "score_file": "2026-09.csv",
+    "score_file_sha256": "e1d893dfbf38a0e31bc706bfde6c5e79f9f915227387c0642c2bbb3c57a6c974",
+    "complete_flag": true,
+    "signal_mode": "month_end",
+    "forward_eligible": true,
+    "data_cutoff": "2026-09-30",
+    "factor_cutoff": {
+      "style_index_sh000905.csv": "2026-09-30 00:00:00",
+      "style_index_sz399006.csv": "2026-09-30 00:00:00",
+      "sw_industry": {
+        "n_files": 31,
+        "min_date": "2026-09-29",
+        "max_date": "2026-09-29",
+        "behind_max": []
+      }
+    },
+    "stale_n": 0,
+    "gap_n": 7
+  },
+  "protocol": {
+    "initial_nav": 1.0,
+    "cohort_weight": 0.16666666666666666,
+    "hold_months": 6,
+    "buy_fee": 0.0015,
+    "sell_fee": 0.005,
+    "buy_fee_deduction": "费用从申购金额中扣除（净申购额 = 金额 × (1 - buy_fee)），费用额计入成本，不摊入份额净值",
+    "return_basis": "official_daily_growth_rate",
+    "return_basis_note": "一律用净值表官方『日增长率』累计；不用累计净值 pct_change、不用净值比",
+    "dividend_policy": "reinvest_via_daily_growth",
+    "dividend_note": "分红再投资：官方日增长率本身为复权口径，等于分红再投且不计税费；不做分红现金另计，也不对分红日做特殊处理",
+    "nav_used": "单位净值(nav)",
+    "nav_lag_policy": "若执行日（或估值日）该基金净值尚未披露：顺延取该基金**下一披露日**净值，并在账本记录 lag_days；不插值、不用上一日净值冒充、不猜",
+    "cash_annual_rate": 0.02,
+    "cash_day_count": "actual/365",
+    "rebalance_policy": "cohort 内不做月度再平衡（目标权重 = 建仓权重）；与历史回测的等权算术聚合口径分列对账，见 docs/PHASE4_前向记账协议.md",
+    "expire_rule": "持有满 HOLD 个月后于到期月移出（expire_month），赎回费仅在到期月计提",
+    "weighting": "cohort 内 50 只等权（cohort_weight / n_codes）",
+    "performance_not_computed": true,
+    "performance_note": "本次封存只固定输入；账本尚未实现，**不得把 active 状态当成绩效验证**"
+  },
+  "n_codes": 50,
+  "weight_per_fund": 0.003333333333333333,
+  "top50": [
+    {
+      "fund_code": "002910",
+      "rank": 1,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "021179",
+      "rank": 2,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "005844",
+      "rank": 3,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "013840",
+      "rank": 4,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "004320",
+      "rank": 5,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "025208",
+      "rank": 6,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "005119",
+      "rank": 7,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "481015",
+      "rank": 8,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "005825",
+      "rank": 9,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001411",
+      "rank": 10,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "007490",
+      "rank": 11,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "024459",
+      "rank": 12,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001198",
+      "rank": 13,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "011369",
+      "rank": 14,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "110005",
+      "rank": 15,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "162214",
+      "rank": 16,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001480",
+      "rank": 17,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "018358",
+      "rank": 18,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "014736",
+      "rank": 19,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "002289",
+      "rank": 20,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "006502",
+      "rank": 21,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "630001",
+      "rank": 22,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "005628",
+      "rank": 23,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "013107",
+      "rank": 24,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "720001",
+      "rank": 25,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001184",
+      "rank": 26,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "023313",
+      "rank": 27,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "011891",
+      "rank": 28,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "010115",
+      "rank": 29,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001437",
+      "rank": 30,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001723",
+      "rank": 31,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "006976",
+      "rank": 32,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001170",
+      "rank": 33,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "013296",
+      "rank": 34,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "020469",
+      "rank": 35,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "021626",
+      "rank": 36,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "016500",
+      "rank": 37,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "001741",
+      "rank": 38,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "002125",
+      "rank": 39,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "008528",
+      "rank": 40,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "011488",
+      "rank": 41,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "019829",
+      "rank": 42,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "005903",
+      "rank": 43,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "002376",
+      "rank": 44,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "501026",
+      "rank": 45,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "519773",
+      "rank": 46,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "310358",
+      "rank": 47,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "010415",
+      "rank": 48,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "018776",
+      "rank": 49,
+      "weight": 0.003333333333333333
+    },
+    {
+      "fund_code": "519770",
+      "rank": 50,
+      "weight": 0.003333333333333333
+    }
+  ],
+  "main_universe": {
+    "count": 4920,
+    "file": "main_universe_2026-09-30.csv",
+    "sha256": "c595541741a03b247bac0f5e88dd9c046c196d098fad986b19c39f787e69e6d7",
+    "note": "可执行全池对照集合（评分日 main 全集）；未来『相对全池』对照以它为准"
+  },
+  "hashes": {
+    "manifest.json": "4ff82715cf257e45ba733cb7a94d19c72f00954224c760f51d5c3a949da157b9",
+    "2026-09.csv": "e1d893dfbf38a0e31bc706bfde6c5e79f9f915227387c0642c2bbb3c57a6c974",
+    "main_universe_2026-09-30.csv": "c595541741a03b247bac0f5e88dd9c046c196d098fad986b19c39f787e69e6d7"
+  },
+  "frozen_by": "freeze_paper_inputs.py"
+}
