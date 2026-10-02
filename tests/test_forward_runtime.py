@@ -41,15 +41,23 @@ class TestExecutionEvent(unittest.TestCase):
         lp.LEDGER_PATH = os.path.join(self.tmp, "portfolio_ledger.csv")
         lp.STATE_PATH = os.path.join(self.tmp, "portfolio_state.json")
         lp.EXECUTION_EVENTS_PATH = os.path.join(self.tmp, "execution_events.jsonl")
-        # 校验"来源 run_id 对应正式完整快照"需 PROJECT_ROOT 指向 fixture（否则查真实快照）
+        # 校验"来源快照完整性"需 PROJECT_ROOT 指向 fixture（否则查真实快照）
         lp.PROJECT_ROOT = self.tmp
         snap_dir = os.path.join(self.tmp, "ml", "snapshots", "20260930_100000")
         os.makedirs(snap_dir, exist_ok=True)
         with open(os.path.join(snap_dir, "COMPLETE"), "w", encoding="utf-8") as f:
             f.write("20260930_100000\n")
+        # P1-2（2026-10-02 审计）：来源快照必须完整——评分副本 + 哈希 + manifest 全字段
+        # （run_id/status/signal_mode/signal_date/评分哈希/Top50/生成时间）
+        score_csv = os.path.join(snap_dir, "2026-09.csv")
+        pd.DataFrame({"fund_code": ["000001", "000002"], "rank": [1, 2]}) \
+            .to_csv(score_csv, index=False)
         with open(os.path.join(snap_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump({"run_id": "20260930_100000", "status": "complete",
-                       "signal_date": "2026-09-18"}, f)
+                       "signal_mode": "month_end", "signal_date": "2026-09-18",
+                       "score_file_sha256": lp._file_sha256(score_csv),
+                       "top50": ["000001", "000002"],
+                       "score_generated_at": "2026-09-18T10:00:00"}, f)
         # 构造 planned 状态的 ledger（**显式传路径**：模块级默认参数在定义时绑定，
 # monkeypatch 模块属性不会影响已绑定的默认值——必须显式传入，避免污染真实 ledger）
         self.pf = lp.LivePortfolio(ledger_path=lp.LEDGER_PATH, state_path=lp.STATE_PATH)
@@ -154,10 +162,10 @@ class TestExecutionEvent(unittest.TestCase):
         self.assertEqual(rec["source_run_id"], "20260930_100000")
         self.assertEqual(rec["execution_date"], "2026-09-21")
         self.assertEqual(rec["operator"], "tester")
-        # 已有事件 → 无需恢复（幂等）
+        # 已有事件且与状态一致 → 无需恢复（幂等）
         rec2 = self.pf.recover_execution("2026-09")
         self.assertFalse(rec2.get("recovered", False))
-        self.assertEqual(rec2.get("note"), "已有确认事件，无需恢复")
+        self.assertEqual(rec2.get("note"), "状态与事件一致，无需恢复")
 
     def test_unknown_cohort_rejected(self):
         with self.assertRaises(KeyError):

@@ -52,7 +52,9 @@ TOP_N = 50
 # 当时代码内容"（2026-09-21 用户 P0：HEAD SHA 在脏工作区不足以复现）
 PROD_SCRIPTS = ["production_pipeline.py", "data_health.py", "live_portfolio.py",
                 "daily_update.py", "live_score.py", "shadow_score.py",
-                "backtest_strategy.py", "data_loader.py", "clean_nav.py", "panel_builder.py"]
+                "backtest_strategy.py", "data_loader.py", "clean_nav.py", "panel_builder.py",
+                # 2026-10-02 审计（第 5 节）：被生产调用的依赖也要纳入快照哈希（来源代码覆盖）
+                "trading_calendar.py", "style_factors.py", "delisted_funds.py"]
 
 
 # ---------------------------------------------------------------- 工具
@@ -150,7 +152,13 @@ def step_health() -> dict:
     return rep
 
 
-def step_live_score(as_of: pd.Timestamp | None) -> tuple:
+def step_live_score(as_of: pd.Timestamp | None, persist: bool = True,
+                    run_id: str | None = None) -> tuple:
+    """计算本月评分并落盘。
+
+    P0-2（2026-10-02 审计）：`persist=False`（含 skip 的诊断运行）时**不覆盖正式评分**
+    `ml/scores/YYYY-MM.csv`，改写到隔离目录 `ml/scores_test/`，避免诊断运行污染正式来源。
+    """
     log("步骤5/8 live_score（主策略 ret_12m Top50，分层/eligibility 与研究同口径）…")
     from live_score import score_cross_section, verify_against_panel
     df, skip, t_date = score_cross_section(as_of)
@@ -158,16 +166,22 @@ def step_live_score(as_of: pd.Timestamp | None) -> tuple:
     n_low = int((df["confidence"] == "low").sum()) if len(df) else 0
     log(f"  评分日 {t_date.date()} | 可评分 {len(df)}（主 {n_main} / 低置信度 {n_low}）"
         f" | 排除 {skip}")
-    os.makedirs(SCORES_DIR, exist_ok=True)
-    path = os.path.join(SCORES_DIR, f"{t_date.strftime('%Y-%m')}.csv")
-    # 不可变性：覆盖既有评分前，先把旧版备份到 snapshots/legacy（保留"那时系统看见了什么"）
-    if os.path.exists(path):
-        bak = os.path.join(SNAPSHOTS_DIR, "legacy", os.path.basename(path))
-        os.makedirs(os.path.dirname(bak), exist_ok=True)
-        if not os.path.exists(bak):
-            import shutil
-            shutil.copy2(path, bak)
-            log(f"  旧版评分已备份：{bak}")
+    if persist:
+        os.makedirs(SCORES_DIR, exist_ok=True)
+        path = os.path.join(SCORES_DIR, f"{t_date.strftime('%Y-%m')}.csv")
+        # 不可变性：覆盖既有评分前，先把旧版备份到 snapshots/legacy（保留"那时系统看见了什么"）
+        if os.path.exists(path):
+            bak = os.path.join(SNAPSHOTS_DIR, "legacy", os.path.basename(path))
+            os.makedirs(os.path.dirname(bak), exist_ok=True)
+            if not os.path.exists(bak):
+                import shutil
+                shutil.copy2(path, bak)
+                log(f"  旧版评分已备份：{bak}")
+    else:
+        test_dir = os.path.join(PROJECT_ROOT, "ml", "scores_test")
+        os.makedirs(test_dir, exist_ok=True)
+        path = os.path.join(test_dir, f"{run_id or 'run'}_{t_date.strftime('%Y-%m')}.csv")
+        log("  （诊断运行：评分写入隔离目录 ml/scores_test/，**不覆盖**正式 ml/scores）")
     df.to_csv(path, index=False)
     log(f"  已落盘 {path}（自动对账见下）")
     verify = {}
@@ -249,14 +263,24 @@ def _check_month_end_data_ready(health: dict, data_cutoff: pd.Timestamp):
 
 
 def step_portfolio(scores_df: pd.DataFrame, t_date: pd.Timestamp, run_id: str,
-                   month_end: bool = True):
-    """月末正式运行 → 推进 6-cohort ledger（score_run=run_id）；月中观察 → 不推进。"""
+                   month_end: bool = True, persist: bool = True):
+    """月末正式运行 → 推进 6-cohort ledger（score_run=run_id）；月中观察 → 不推进。
+
+    P0-2（2026-10-02 审计）：`persist=False`（诊断/test 运行）时用**纯计算路径**——
+    只在内存里算本月动作供 manifest 记录，**不写盘、不改正式 ledger/state**。
+    旧实现先推进正式 planned 选股与 score_run，再决定本次是 test，导致诊断运行把来源
+    改成没有 COMPLETE 的测试 run，随后的正式确认反被"来源不完整"校验拒绝。
+    """
     mode = "month_end" if month_end else "observation"
-    log(f"步骤7/8 live_portfolio（{mode}；score_run={run_id}）…")
+    log(f"步骤7/8 live_portfolio（{mode}；score_run={run_id}；persist={persist}）…")
     from live_portfolio import LivePortfolio
     pf = LivePortfolio()
-    if month_end:
+    if month_end and persist:
         action = pf.add_month(scores_df, score_run=run_id)
+    elif month_end:
+        action = pf.add_month(scores_df, score_run=run_id, persist=False)
+        action = {**action, "applied": False, "mode": "test_no_persist",
+                  "reason": "诊断运行（含 skip）：仅在内存计算，未推进正式 ledger（P0-2 审计）"}
     else:
         action = {"mode": "observation", "applied": False,
                   "reason": "月中评分仅作数据与评分观察（月末信号规则），不推进正式 cohort"}
@@ -329,7 +353,16 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
              捕获后返回 aborted）。skip_* 用于 CLI 诊断/重试，对应快照只写 NOT_COMPLETE_TEST。
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log(f"run_id={run_id}（commit={git_head_sha()[:8]}）")
+    # P0-2（2026-10-02 审计）：**在触碰任何正式产物之前**就确定运行模式。
+    #   test（含 skip 开关）→ 评分写隔离目录、ledger 走纯计算，绝不污染正式来源。
+    #   as_of 非空（事后重建）→ 记录 provenance，且不计入前向样本。
+    is_test = bool(skip_refresh or skip_clean)
+    is_reconstruction = as_of is not None
+    log(f"run_id={run_id}（commit={git_head_sha()[:8]}｜mode="
+        f"{'test' if is_test else 'production'}｜persist={not is_test}）")
+    if is_reconstruction:
+        log(f"⚠️ --as-of={as_of}：**事后重建**运行，manifest 会标记 is_reconstruction=true，"
+            f"不得计为真正的前向证据")
 
     health = None
     scores_path = None
@@ -351,17 +384,20 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
         raise RuntimeError(f"data_health FAIL（{health.get('shadow_stale', '')}）→ 中止评分")
 
     as_of_ts = pd.Timestamp(as_of) if as_of else None
-    scores_df, t_date, scores_path, score_meta = step_live_score(as_of_ts)
+    scores_df, t_date, scores_path, score_meta = step_live_score(
+        as_of_ts, persist=not is_test, run_id=run_id)
     data_cutoff = t_date
 
     shadow_path, shadow_stale = step_shadow_score(health, data_cutoff)
 
     # 月末信号门禁：只有"当月最后交易日"的评分才推进正式 cohort（写 COMPLETE）
     month_end = _is_month_end(data_cutoff)
-    if month_end:
+    if month_end and not is_test:
         # P1（2026-09-24）：月末正式运行前必须**净值齐全**（stale==0 且 processed 中位==评分日）
         _check_month_end_data_ready(health, data_cutoff)
-    pf, action, agg = step_portfolio(scores_df, t_date, run_id, month_end)
+    elif month_end and is_test:
+        log("  （诊断运行：跳过月末门禁的强中止语义，但 ledger 不推进）")
+    pf, action, agg = step_portfolio(scores_df, t_date, run_id, month_end, persist=not is_test)
 
     main = scores_df[scores_df["confidence"] == "main"] if "confidence" in scores_df.columns else scores_df
     top50 = main.sort_values("rank").head(TOP_N) if "rank" in main.columns else \
@@ -369,6 +405,13 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
     manifest = {
         "run_id": run_id, "git_commit_sha": git_head_sha(),
         "strategy_version": STRATEGY_VERSION,
+        # P0-2（2026-10-02 审计）：运行模式与来源 provenance（事后重建 ≠ 前向证据）
+        "run_mode": "test" if is_test else ("complete" if month_end else "observation"),
+        "run_flags": {"skip_refresh": skip_refresh, "skip_clean": skip_clean},
+        "persisted": not is_test,
+        "as_of_requested": as_of,
+        "is_reconstruction": is_reconstruction,
+        "forward_eligible": (not is_test) and month_end and (not is_reconstruction),
         "data_cutoff": str(data_cutoff.date()),
         "benchmark_cutoff": str(health["benchmark_latest_date"]),
         "raw_cutoff": health.get("raw_latest_date"),

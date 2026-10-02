@@ -1,0 +1,351 @@
+{
+  "audit_date": "2026-10-02",
+  "existing_tests": {
+    "count": 32,
+    "status": "PASS"
+  },
+  "probe_note": "Date-column dtype normalized only inside temporary fixture for holiday/source/correction probes; first-confirm probe uses unmodified CSV reload.",
+  "artifact_checks": {
+    "run_id": "20260930_233855",
+    "manifest_status": "complete",
+    "complete_exists": true,
+    "score_hash_matches": true,
+    "current_score_matches_snapshot": true,
+    "current_ledger_matches_snapshot": true,
+    "current_state_matches_snapshot": true,
+    "top50_matches_score_ranks": true,
+    "top50_matches_manifest": true,
+    "ledger_matches_top50": true,
+    "ledger_rows": 50,
+    "ledger_unique_funds": 50,
+    "planned_cohort_weight": 0.166666666666665,
+    "state": {
+      "cohorts": {
+        "2026-09": {
+          "signal_date": "2026-09-30",
+          "execution_date": null,
+          "expire_month": "2027-03",
+          "cohort_weight": 0.16666666666666666,
+          "n_codes": 50,
+          "created_at": "2026-09-21T10:54:26",
+          "status": "planned",
+          "updated_at": "2026-09-30T23:44:30",
+          "score_run": "20260930_233855"
+        }
+      },
+      "last_month": "2026-09",
+      "portfolio": {
+        "n_active": 0,
+        "active_cohorts": [],
+        "n_funds": 0,
+        "target_weights": {},
+        "cash_weight": 1.0,
+        "sum_weights": 1.0
+      }
+    },
+    "snapshot_score_count": 5122,
+    "main_count": 4920,
+    "low_count": 202,
+    "script_hash_mismatches": [],
+    "shadow_file_present": false,
+    "top50_min_coverage": 0.9605,
+    "top50_min_age_months": 12.6,
+    "execution_events_present": false,
+    "loaded_execution_date_dtype": "float64",
+    "independent_top51_return_check": {
+      "n": 51,
+      "max_abs_diff": 5.995204332975845e-15,
+      "dates": [
+        "2026-09-30"
+      ],
+      "issues": [],
+      "rank50_score": 0.7921708576688855,
+      "rank51_score": 0.7916712686490928
+    },
+    "current_health": {
+      "generated_at": "2026-10-02T19:17:44",
+      "benchmark_latest": "2026-09-30 00:00:00",
+      "benchmark_latest_date": "2026-09-30",
+      "raw_latest": "2026-09-30 00:00:00",
+      "raw_latest_date": "2026-09-30",
+      "raw_funds": 11419,
+      "processed_dist": {
+        "median": "2026-09-30",
+        "p25": "2026-09-30",
+        "min": "2026-09-18",
+        "max": "2026-09-30",
+        "n_funds": 5317,
+        "n_at_max": 5310,
+        "n_behind_max_gt1d": 7
+      },
+      "processed_latest_date": "2026-09-30",
+      "processed_funds": 5317,
+      "stale_n": 1,
+      "gap_n": 5,
+      "gap_scope": "alive 现存池，交易日口径（gap=落后≥2交易日）",
+      "catchup": "见最近 pipeline manifest（data_health 独立运行不拉取）",
+      "shadow_factors": {
+        "style_index_sh000905.csv": "2026-09-30 00:00:00",
+        "style_index_sz399006.csv": "2026-09-30 00:00:00",
+        "sw_industry": {
+          "n_files": 31,
+          "min_date": "2026-09-29",
+          "max_date": "2026-09-29",
+          "behind_max": []
+        }
+      },
+      "last_scores": {
+        "file": "2026-09.csv",
+        "as_of": "2026-09-30",
+        "total": 5122,
+        "main": 4920,
+        "low": 202
+      },
+      "shadow_stale": [
+        "sw_industry(最旧 2026-09-29)"
+      ],
+      "status": "WARN",
+      "score_ready": true
+    },
+    "gap_exceptions_current": [
+      {
+        "code": "002213",
+        "in_top50": false,
+        "raw_last_date": "2026-09-30",
+        "processed_last_date": "2026-09-28"
+      },
+      {
+        "code": "166007",
+        "in_top50": false,
+        "raw_last_date": "2026-09-29",
+        "processed_last_date": "2026-09-28"
+      },
+      {
+        "code": "002224",
+        "in_top50": false,
+        "raw_last_date": "2026-09-24",
+        "processed_last_date": "2026-09-24"
+      },
+      {
+        "code": "018975",
+        "in_top50": false,
+        "raw_last_date": "2026-09-24",
+        "processed_last_date": "2026-09-24"
+      },
+      {
+        "code": "018539",
+        "in_top50": false,
+        "raw_last_date": "2026-09-22",
+        "processed_last_date": "2026-09-22"
+      },
+      {
+        "code": "002614",
+        "in_top50": false,
+        "raw_last_date": "2026-09-21",
+        "processed_last_date": "2026-09-21"
+      },
+      {
+        "code": "004772",
+        "in_top50": false,
+        "raw_last_date": "2026-09-18",
+        "processed_last_date": "2026-09-18"
+      }
+    ],
+    "snapshot_list": [
+      {
+        "run_id": "20260921_104949",
+        "status": "complete",
+        "signal_date": "2026-09-18",
+        "signal_mode": null,
+        "complete": true
+      },
+      {
+        "run_id": "20260922_100411",
+        "status": "complete",
+        "signal_date": "2026-09-21",
+        "signal_mode": null,
+        "complete": true
+      },
+      {
+        "run_id": "20260922_104956",
+        "status": "complete",
+        "signal_date": "2026-09-21",
+        "signal_mode": null,
+        "complete": true
+      },
+      {
+        "run_id": "20260923_221446",
+        "status": "observation",
+        "signal_date": "2026-09-23",
+        "signal_mode": "observation",
+        "complete": false
+      },
+      {
+        "run_id": "20260924_130742",
+        "status": "observation",
+        "signal_date": "2026-09-23",
+        "signal_mode": "observation",
+        "complete": false
+      },
+      {
+        "run_id": "20260930_233855",
+        "status": "complete",
+        "signal_date": "2026-09-30",
+        "signal_mode": "month_end",
+        "complete": true
+      }
+    ],
+    "panels": {
+      "panel.parquet": 126124,
+      "panel_v3.parquet": 425235
+    },
+    "exception_return_check": {
+      "top50_score_cutoff": 0.7921708576688855,
+      "rows": [
+        {
+          "fund_code": "002213",
+          "snapshot_rank": 1840.0,
+          "snapshot_score": 0.0590551693611953,
+          "current_raw_ret12m": 0.06466816175881096,
+          "raw_latest": "2026-09-30"
+        },
+        {
+          "fund_code": "166007",
+          "snapshot_rank": 2396.0,
+          "snapshot_score": 0.0257734727520795,
+          "current_raw_ret12m": 0.026081204793903412,
+          "raw_latest": "2026-09-29"
+        },
+        {
+          "fund_code": "002224",
+          "snapshot_rank": null,
+          "snapshot_score": null,
+          "current_raw_ret12m": 0.017363495447523025,
+          "raw_latest": "2026-09-24"
+        },
+        {
+          "fund_code": "018975",
+          "snapshot_rank": 4331.0,
+          "snapshot_score": -0.1610805420033664,
+          "current_raw_ret12m": -0.16108054200336552,
+          "raw_latest": "2026-09-24"
+        },
+        {
+          "fund_code": "018539",
+          "snapshot_rank": 3079.0,
+          "snapshot_score": -0.0099839446198135,
+          "current_raw_ret12m": -0.009983944619813667,
+          "raw_latest": "2026-09-22"
+        },
+        {
+          "fund_code": "002614",
+          "snapshot_rank": 3030.0,
+          "snapshot_score": -0.0058297065653307,
+          "current_raw_ret12m": -0.005829706565333104,
+          "raw_latest": "2026-09-21"
+        },
+        {
+          "fund_code": "004772",
+          "snapshot_rank": null,
+          "snapshot_score": null,
+          "current_raw_ret12m": 0.003581823447673882,
+          "raw_latest": "2026-09-18"
+        }
+      ],
+      "note": "Independent arithmetic using current local raw official daily-growth-rate field; no remote-source refresh."
+    }
+  },
+  "isolated_behavioral_probes": {
+    "first_confirmation_after_csv_reload_fails": {
+      "initial_execution_date_dtype": "float64",
+      "execution_date": "2026-10-08",
+      "error": "TypeError: Invalid value '2026-10-08' for dtype 'float64'",
+      "disk_status_after": "planned",
+      "memory_status_after": "active",
+      "events_present": false
+    },
+    "holiday_execution_accepted": {
+      "accepted": true,
+      "event_date": "2026-10-01",
+      "status": "active"
+    },
+    "weekend_execution_accepted": {
+      "accepted": true,
+      "event_date": "2026-10-10"
+    },
+    "altered_selection_accepted": {
+      "accepted": true,
+      "source_run_id": "20260930_233855",
+      "altered_fund": "999999"
+    },
+    "invalid_manifest_accepted": {
+      "accepted": true,
+      "source_status": "aborted",
+      "event_date": "2026-10-08"
+    },
+    "new_cohort_autoactive_without_confirmation": {
+      "status": "active",
+      "execution_date": "2026-10-08",
+      "events_present": false
+    },
+    "test_pipeline_mutates_realistic_planned_fixture": {
+      "snapshot_status": "test",
+      "cohort_source_after": "20261020_120000",
+      "selection_after": "999999",
+      "confirm_error": "来源 run_id=20261020_120000 不是正式完整快照（缺 COMPLETE），不能确认执行"
+    },
+    "no_save_cli_writes": {
+      "persisted_selection": "999998"
+    },
+    "correction_breaks_idempotence": {
+      "current_execution_date": "2026-10-09",
+      "new_date_retry_error": "cohort 2026-09 已 active 且确认内容不同（现有 paper/2026-10-08）——如需修正请用 correct_execution 写显式 execution_correction 事件",
+      "old_date_retry_returns": "2026-10-08",
+      "old_date_idempotent": true
+    },
+    "correction_append_failure_inconsistent": {
+      "error": "fixture disk full",
+      "persisted_date": "2026-10-09",
+      "latest_event_date": "2026-10-08",
+      "recovery_note": "已有确认事件，无需恢复"
+    },
+    "snapshot_failure_leaves_planned_changed": {
+      "selection_after": "999997",
+      "source_after": "20261020_120000",
+      "source_complete": false
+    },
+    "month_end_accepts_unrecorded_gap49": {
+      "accepted": true,
+      "gap_n": 49
+    },
+    "holiday_benchmark_false_failure": {
+      "status": "FAIL",
+      "benchmark_latest": "2026-09-30",
+      "at": "2026-10-08T09:00:00"
+    },
+    "missed_expiry_month_not_caught_up": {
+      "old_expire_month": "2027-03",
+      "new_signal_month": "2027-04",
+      "old_status_after": "active",
+      "expired_cohorts": []
+    }
+  },
+  "protected_files_changed": [],
+  "protected_files_checked": 98,
+  "accounting_counterexample": {
+    "initial_weights": [
+      0.5,
+      0.5
+    ],
+    "month1_returns": [
+      1.0,
+      0.0
+    ],
+    "month2_returns": [
+      0.0,
+      1.0
+    ],
+    "month2_buy_hold_return": 0.3333333333333333,
+    "month2_equal_weight_mean_return": 0.5
+  }
+}
