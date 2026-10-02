@@ -112,6 +112,11 @@ def month_add(key: str, n: int) -> str:
     return f"{i // 12:04d}-{i % 12 + 1:02d}"
 
 
+def month_diff(a: str, b: str) -> int:
+    """b − a 的月数（均为 'YYYY-MM'）。"""
+    return ((int(b[:4]) * 12 + int(b[5:7])) - (int(a[:4]) * 12 + int(a[5:7])))
+
+
 def next_trading_day_after(d: pd.Timestamp, calendar_path: str | None = None) -> pd.Timestamp | None:
     """信号日后的下一个交易日（production assumption：可提交日）。
 
@@ -214,14 +219,30 @@ class LivePortfolio:
         expire_month = month_add(month_key, HOLD)
         now = datetime.now().isoformat(timespec="seconds")
 
-        # 到期：expire_month == 本月的 **active** cohort 标记 expired
-        expired_now = []
-        for cid in list(self.state["cohorts"]):
-            if self.state["cohorts"][cid].get("expire_month") == month_key and \
-                    self.state["cohorts"][cid].get("status") == "active":
-                self.state["cohorts"][cid]["status"] = "expired"
+        # 到期识别（2026-10-02 审计第 5 节：漏月到期追补）：
+        #   - expire_month == 本月 → 正常到期，标记 expired；
+        #   - expire_month < 本月（漏跑该月）→ **只识别为 overdue，不自动改状态**：
+        #     "识别过期"与"实际赎回确认"是两件事，状态变更必须由显式 confirm_expiry 写事件留痕。
+        expired_now, overdue_now = [], []
+        for cid in sorted(self.state["cohorts"]):
+            m = self.state["cohorts"][cid]
+            if m.get("status") != "active":
+                continue
+            exp = m.get("expire_month")
+            if not exp:
+                continue
+            if exp == month_key:
+                m["status"] = "expired"
+                m["expired_at_month"] = month_key
                 self.ledger.loc[self.ledger["cohort_id"] == cid, "status"] = "expired"
                 expired_now.append(cid)
+            elif exp < month_key:
+                overdue_now.append({"cohort": cid, "expire_month": exp,
+                                    "months_overdue": month_diff(exp, month_key),
+                                    "note": "已过到期月但状态仍 active（漏月/未确认赎回）——"
+                                            "须核对后用 confirm_expiry 留痕"})
+        if overdue_now:
+            self.state["overdue_cohorts"] = overdue_now
 
         # 同月 planned 更新：替换选股（保留 cohort_id；expire/权重不变）
         if renewed:
@@ -245,6 +266,7 @@ class LivePortfolio:
             return {"status": "updated", "month": month_key, "signal_date": signal_date,
                     "execution_date": exec_date_str, "cohort_status": meta["status"],
                     "new_codes": len(codes), "expired_cohorts": sorted(expired_now),
+                    "overdue_cohorts": overdue_now,
                     "score_run": score_run, "cash_weight": act["cash_weight"],
                     "n_active_cohorts": act["n_active"]}
 
@@ -278,6 +300,7 @@ class LivePortfolio:
             "month": month_key, "signal_date": signal_date, "execution_date": exec_date_str,
             "cohort_status": status,      # planned（待确认）/ active（已确认执行）
             "new_codes": len(codes), "expired_cohorts": sorted(expired_now),
+            "overdue_cohorts": overdue_now,
             "expired_codes": int(len(self.ledger[(self.ledger["expire_month"] == month_key)
                                                   & (self.ledger["status"] == "expired")])) if expired_now else 0,
             "buy_weight_risk": cohort_weight if status == "active" else 0.0,  # planned 未投入
@@ -449,6 +472,87 @@ class LivePortfolio:
                 f"cohort {cohort_id} 状态为 {status}，但事件流已有确认事实 "
                 f"（{fact['exec_type']}/{fact['execution_date']}）——状态与事件矛盾，请人工核对")
         raise ValueError("只有 active 且缺事件的 cohort 需要恢复（planned 请直接 confirm_execution）")
+
+    def confirm_expiry(self, cohort_id: str, reason: str, operator: str = "local_user") -> dict:
+        """**到期赎回确认**（2026-10-02 审计第 5 节：识别过期 ≠ 实际赎回确认）。
+
+        `add_month` 只把 `expire_month == 当月` 的 cohort 标记 expired，并把"已过到期月仍 active"
+        记为 `overdue_cohorts` 供人工核销；真正的状态变更由本方法完成并写不可变 `cohort_expiry` 事件
+        （含到期月、逾期月数、原因、操作人、状态哈希）。仅允许对 active 且 `expire_month <= 当前月`
+        的 cohort 执行；相同重试幂等返回既有事件；事件写入失败则回滚状态。
+        """
+        if cohort_id not in self.state["cohorts"]:
+            raise KeyError(f"cohort {cohort_id} 不存在")
+        if not reason or not str(reason).strip():
+            raise ValueError("reason 必填（到期赎回确认须说明依据）")
+        meta = self.state["cohorts"][cohort_id]
+        cur = datetime.now().strftime("%Y-%m")
+        fact = self._current_expiry_fact(cohort_id)
+        if meta.get("status") == "expired":
+            if fact:
+                return {**fact["event"], "idempotent": True}
+            raise ValueError(f"cohort {cohort_id} 已是 expired 但事件流无到期记录（历史遗留）——"
+                             f"请人工核对后补记录")
+        if meta.get("status") != "active":
+            raise ValueError(f"cohort {cohort_id} 状态为 {meta.get('status')}，只有 active cohort 可确认到期")
+        exp = meta.get("expire_month")
+        if not exp or exp > cur:
+            raise ValueError(f"cohort {cohort_id} 到期月为 {exp}，尚未到期（当前 {cur}）——"
+                             f"不得提前确认赎回")
+
+        new_meta = dict(meta)
+        new_meta["status"] = "expired"
+        new_meta["expired_at_month"] = cur
+        new_meta["expiry_confirmed_at"] = datetime.now().isoformat(timespec="seconds")
+        new_meta["expiry_reason"] = str(reason).strip()
+        self.state["cohorts"][cohort_id] = new_meta
+        self.ledger.loc[self.ledger["cohort_id"] == cohort_id, "status"] = "expired"
+        self.save()
+        ev = {
+            "event_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "type": "cohort_expiry",
+            "cohort": cohort_id,
+            "source_run_id": meta.get("score_run"),
+            "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+            "expire_month": exp,
+            "confirmed_at_month": cur,
+            "months_overdue": month_diff(exp, cur),
+            "reason": str(reason).strip(),
+            "operator": operator,
+            "previous": {"status": meta.get("status"),
+                         "execution_date": meta.get("execution_date")},
+            "ledger_sha256": _file_sha256(self.ledger_path),
+            "state_sha256": _file_sha256(self.state_path),
+        }
+        try:
+            self._append_event(ev)
+        except Exception as e:  # noqa: BLE001
+            self._restore_cohort(cohort_id, meta)
+            raise RuntimeError(f"到期事件写入失败，已回滚状态（{e}）") from e
+        self._verify_exec_event(ev)
+        # 成功后清理该 cohort 的 overdue 标记（识别 → 确认闭环）
+        if self.state.get("overdue_cohorts"):
+            self.state["overdue_cohorts"] = [o for o in self.state["overdue_cohorts"]
+                                             if o.get("cohort") != cohort_id]
+            self.save()
+        return ev
+
+    def _current_expiry_fact(self, cohort_id: str) -> dict | None:
+        """事件流里的到期事实（type=cohort_expiry）。"""
+        p = self._events_path()
+        if not os.path.exists(p):
+            return None
+        fact = None
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("cohort") == cohort_id and ev.get("type") == "cohort_expiry":
+                    fact = {"event": ev, "event_id": ev.get("event_id"),
+                            "expire_month": ev.get("expire_month")}
+        return fact
 
     # ---- 执行确认辅助 ----
     def _restore_cohort(self, cohort_id: str, meta: dict):
