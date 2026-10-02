@@ -347,6 +347,108 @@ def restore_official_ledger(bak: dict):
     log(f"  已回滚正式台账到运行前版本：{bak['ledger_path']}、{bak['state_path']}")
 
 
+# ---------------------------------------------------------------- 快照完整性 / 运行锁
+def _dir_file_hashes(d: str) -> dict:
+    """目录内所有文件的相对路径 → {sha256, bytes}（完整性清单用）。"""
+    out = {}
+    for root, _dirs, files in os.walk(d):
+        for fn in sorted(files):
+            p = os.path.join(root, fn)
+            rel = os.path.relpath(p, d).replace("\\", "/")
+            out[rel] = {"sha256": file_sha256(p), "bytes": os.path.getsize(p)}
+    return out
+
+
+def snapshot_input_hashes(health: dict) -> dict:
+    """快照的**输入侧**版本与哈希（最低限度可核验的输入留痕）。
+
+    审计第 5 节：仅靠输出哈希无法说明"当时用的是哪份输入"。这里记录基准文件与
+    processed 索引文件的 sha256 + 关键数据日期；完整的输入切片（逐基金净值）体积过大，
+    由 data/ 层单独维护，不放进不可变快照。
+    """
+    out = {}
+    bench = os.path.join(PROJECT_ROOT, "data", "raw", "benchmark_hs300.csv")
+    idx = os.path.join(PROJECT_ROOT, "data", "processed", "fund_history_index.csv")
+    if os.path.exists(bench):
+        out["benchmark_hs300.csv"] = {"sha256": file_sha256(bench),
+                                      "latest_date": health.get("benchmark_latest_date")}
+    if os.path.exists(idx):
+        out["fund_history_index.csv"] = {"sha256": file_sha256(idx),
+                                         "n_funds": health.get("processed_funds")}
+    out["raw_latest_date"] = health.get("raw_latest_date")
+    out["processed_latest_date"] = health.get("processed_latest_date")
+    out["processed_dist"] = health.get("processed_dist")
+    out["factor_cutoff"] = health.get("shadow_factors")
+    return out
+
+
+def verify_snapshot(snap_dir: str) -> dict:
+    """校验快照完整性链：产物哈希（files.json）→ manifest 引用 → COMPLETE 引用。
+
+    :return: {"dir","ok","checked","mismatches","errors"}
+    """
+    res = {"dir": snap_dir, "ok": False, "checked": 0, "mismatches": [], "errors": []}
+    files_json = os.path.join(snap_dir, "files.json")
+    mf_path = os.path.join(snap_dir, "manifest.json")
+    comp = os.path.join(snap_dir, "COMPLETE")
+    if not os.path.exists(files_json):
+        res["errors"].append("缺 files.json（完整性清单）")
+        return res
+    with open(files_json, encoding="utf-8") as f:
+        listed = json.load(f)
+    for rel, meta in (listed.get("files") or {}).items():
+        p = os.path.join(snap_dir, rel.replace("/", os.sep))
+        if not os.path.exists(p):
+            res["mismatches"].append({"file": rel, "why": "缺失"})
+        elif file_sha256(p) != meta.get("sha256"):
+            res["mismatches"].append({"file": rel, "why": "哈希不符（内容被改动）"})
+        else:
+            res["checked"] += 1
+    if not os.path.exists(mf_path):
+        res["errors"].append("缺 manifest.json")
+    else:
+        with open(mf_path, encoding="utf-8") as f:
+            mf = json.load(f)
+        if mf.get("output_files_sha256") and mf["output_files_sha256"] != file_sha256(files_json):
+            res["mismatches"].append({"file": "files.json", "why": "与 manifest 记录不符"})
+    if os.path.exists(comp):
+        with open(comp, encoding="utf-8") as f:
+            txt = f.read()
+        if "manifest_sha256=" in txt:
+            recorded = txt.split("manifest_sha256=")[1].split()[0]
+            if recorded != file_sha256(mf_path):
+                res["mismatches"].append({"file": "manifest.json", "why": "与 COMPLETE 记录不符"})
+    res["ok"] = not res["mismatches"] and not res["errors"]
+    return res
+
+
+def _acquire_run_lock() -> str:
+    """正式运行的并发锁（O_EXCL 创建）；已被占用则拒绝启动。"""
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    lock = os.path.join(SNAPSHOTS_DIR, ".run.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            with open(lock, encoding="utf-8") as f:
+                info = f.read().strip()
+        except Exception:  # noqa: BLE001
+            info = "（无法读取锁内容）"
+        raise RuntimeError(
+            f"已有生产运行在进行（锁 {lock}：{info}）——确认无并发运行后人工删除锁文件再重试") from None
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"pid={os.getpid()} started_at={datetime.now().isoformat(timespec='seconds')}\n")
+    return lock
+
+
+def _release_run_lock(lock: str | None):
+    if lock and os.path.exists(lock):
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
 def mark_aborted_snapshot(run_id: str, reason: str):
     """快照写入失败时，把已创建但不完整的目录显式标记为非正式（绝不冒充 COMPLETE）。"""
     snap = os.path.join(SNAPSHOTS_DIR, run_id)
@@ -400,6 +502,9 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
     """
     log(f"步骤8/8 不可变 snapshot…（mode={mode}）")
     snap = os.path.join(SNAPSHOTS_DIR, run_id)
+    # 审计第 5 节：run_id 为秒级且原先 exist_ok=True，并发/重复运行可能覆盖同名目录 → 明确拒绝
+    if os.path.exists(snap) and os.listdir(snap):
+        raise RuntimeError(f"快照目录已存在且非空：{snap}——run_id 冲突或并发运行，拒绝覆盖")
     os.makedirs(snap, exist_ok=True)
     # 文件副本
     import shutil
@@ -416,32 +521,44 @@ def step_snapshot(run_id, manifest: dict, scores_path, shadow_path, health,
     manifest["cohort_action"] = action
     manifest["top50"] = top50["fund_code"].tolist()
     manifest["shadow_factor_refresh"] = shadow_factor_refresh
+    manifest["status"] = {"test": "test", "observation": "observation"}.get(mode, "complete")
+
+    # ---- 完整性链（审计第 5 节）：产物清单 files.json → manifest 引用 → 标记文件引用 manifest ----
+    listed = {"run_id": run_id, "mode": mode, "signal_date": manifest.get("signal_date"),
+              "generated_at": datetime.now().isoformat(timespec="seconds"),
+              "note": "本清单覆盖除 manifest.json / files.json / 标记文件之外的全部快照产物；"
+                      "production_pipeline.verify_snapshot() 按此链校验完整性。",
+              "files": _dir_file_hashes(snap)}
+    files_json = os.path.join(snap, "files.json")
+    with open(files_json, "w", encoding="utf-8") as f:
+        json.dump(listed, f, ensure_ascii=False, indent=2)
+    manifest["output_files"] = sorted(listed["files"].keys())
+    manifest["output_files_sha256"] = file_sha256(files_json)
+    manifest["input_data"] = snapshot_input_hashes(health)     # 输入侧版本/哈希留痕
+    mf_path = os.path.join(snap, "manifest.json")
+    with open(mf_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
+    mf_sha = file_sha256(mf_path)
+
     # 只有"月末正式"运行才写 COMPLETE（v1.1.2 月末信号门禁 + v1.1 skip 规则）
     if mode == "test":
-        manifest["status"] = "test"
-        with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
         with open(os.path.join(snap, "NOT_COMPLETE_TEST"), "w", encoding="utf-8") as f:
-            f.write(f"{manifest['run_id']} test_run_at={manifest['score_generated_at']}\n"
+            f.write(f"{manifest['run_id']} test_run_at={manifest['score_generated_at']} "
+                    f"manifest_sha256={mf_sha}\n"
                     f"原因：本次运行含 skip 开关（诊断/重试），非正式 forward 记录\n")
         log(f"  ⚠️ snapshot 已写入 {snap}（**NOT_COMPLETE_TEST**：含 skip 开关，非正式记录）")
         return snap
     if mode == "observation":
-        manifest["status"] = "observation"
-        with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
         with open(os.path.join(snap, "NOT_COMPLETE_OBSERVATION"), "w", encoding="utf-8") as f:
-            f.write(f"{manifest['run_id']} observation_at={manifest['score_generated_at']}\n"
+            f.write(f"{manifest['run_id']} observation_at={manifest['score_generated_at']} "
+                    f"manifest_sha256={mf_sha}\n"
                     f"原因：月中评分仅作数据与评分观察（月末信号规则），未推进正式 cohort\n")
         log(f"  👁️ snapshot 已写入 {snap}（**NOT_COMPLETE_OBSERVATION**：月中观察，非正式记录）")
         return snap
-    manifest["status"] = "complete"      # 只有全部步骤成功、月末正式、快照落盘后才置 complete
-    with open(os.path.join(snap, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
-    # COMPLETE 标志：与 manifest.status=complete 一致；缺失即"半次正式运行"，可用 .bak/legacy 回滚
     with open(os.path.join(snap, "COMPLETE"), "w", encoding="utf-8") as f:
-        f.write(f"{manifest['run_id']} completed_at={manifest['score_generated_at']}\n")
-    log(f"  snapshot 已写入 {snap}（COMPLETE 标志已落盘）")
+        f.write(f"{manifest['run_id']} completed_at={manifest['score_generated_at']} "
+                f"manifest_sha256={mf_sha}\n")
+    log(f"  snapshot 已写入 {snap}（COMPLETE 标志 + 完整性清单 files.json 已落盘）")
     return snap
 
 
@@ -451,7 +568,19 @@ def run_pipeline(skip_refresh: bool = False, skip_clean: bool = False,
 
     :return: {"run_id", "snapshot", "manifest", "status"}；任一关键步骤失败抛异常（调用方
              捕获后返回 aborted）。skip_* 用于 CLI 诊断/重试，对应快照只写 NOT_COMPLETE_TEST。
+
+    审计第 5 节：正式运行期间持有 `ml/snapshots/.run.lock` 并发锁（诊断/test 运行不加锁，
+    因为它们不写正式产物）；异常路径由 finally 释放。
     """
+    lock = None if (skip_refresh or skip_clean) else _acquire_run_lock()
+    try:
+        return _run_pipeline_inner(skip_refresh, skip_clean, as_of)
+    finally:
+        _release_run_lock(lock)
+
+
+def _run_pipeline_inner(skip_refresh: bool = False, skip_clean: bool = False,
+                        as_of: str | None = None) -> dict:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     # P0-2（2026-10-02 审计）：**在触碰任何正式产物之前**就确定运行模式。
     #   test（含 skip 开关）→ 评分写隔离目录、ledger 走纯计算，绝不污染正式来源。
