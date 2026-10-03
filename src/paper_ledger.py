@@ -287,7 +287,9 @@ class PaperLedger:
                                           "operator": fact.get("operator")}
             payload["diagnostic"] = False          # 已绑定确认的执行事实 → 正式身份
             payload.pop("note", None)
-        out_dir = out_dir or (self.dryrun_dir if simulate else self.out_dir)
+        if payload["diagnostic"]:
+            self._ensure_diag_dir(out_dir)          # 预演/纯计算产物只能写 dryrun 子树
+        out_dir = out_dir or (self.dryrun_dir if payload["diagnostic"] else self.out_dir)
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"paper_ledger_{self.cohort}.json")
         if os.path.exists(path):
@@ -420,6 +422,27 @@ class PaperLedger:
             return json.load(f)
 
     @staticmethod
+    def _is_within(child: str, parent: str) -> bool:
+        """child 是否等于 parent 或位于其子树内（大小写与分隔符归一）。"""
+        c = os.path.normcase(os.path.normpath(os.path.abspath(child)))
+        p = os.path.normcase(os.path.normpath(os.path.abspath(parent)))
+        return c == p or c.startswith(p.rstrip("\\/") + os.sep)
+
+    def _ensure_diag_dir(self, out_dir: str | None):
+        """诊断/预演产物**只允许**写入配置的 dryrun 目录及其子目录（P1，2026-10-02 四次复核）。
+
+        旧守卫只在"目标路径恰好等于正式目录"时拒绝，于是 `out_dir=正式目录/子目录` 或
+        `open_position(simulate=True, out_dir=正式目录)` 都能把预演产物写进正式区，
+        随后正式建仓会被"已有不同内容账本"挡住。现在两个入口共用同一判定。
+        """
+        if out_dir is None:
+            return
+        if not self._is_within(out_dir, self.dryrun_dir):
+            raise RuntimeError(
+                f"诊断/预演产物只能写入 dryrun 目录及其子目录（{os.path.abspath(self.dryrun_dir)}），"
+                f"收到 {os.path.abspath(out_dir)}")
+
+    @staticmethod
     def _comparable(val: dict) -> dict:
         """幂等比较视图：剔除易变字段与**纯来源记录**（P2 2026-10-02 三次复核）。
 
@@ -451,8 +474,8 @@ class PaperLedger:
         if val.get("status") == "pending":
             raise RuntimeError("估值处于 pending（成交净值日尚未到来）——不得落盘为完成估值")
         diag = bool(val.get("simulated") or val.get("diagnostic"))
-        if diag and out_dir and os.path.abspath(out_dir) == os.path.abspath(self.out_dir):
-            raise RuntimeError("诊断/预演结果不得写入正式目录 ml/paper/ledgers/（只能写 dryrun/）")
+        if diag:
+            self._ensure_diag_dir(out_dir)          # 只能写 dryrun 目录及其子目录
         if not diag:
             # P1（2026-10-02 三次复核）：正式估值落盘前**再次**核对执行事实
             self._verify_official_execution(val.get("cohort"), val.get("run_id"),

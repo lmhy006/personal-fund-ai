@@ -266,17 +266,34 @@ class TestPaperLedgerHardening(_LedgerFixture):
         self.assertEqual(led2.save_valuation(val2)["status"], "existing")   # 不再被误拒
 
     def test_diagnostic_result_cannot_write_official_dir(self):
-        """P1：未确认执行的计算结果必须带诊断身份，且不得写入正式目录。"""
+        """P1：诊断/预演产物只能写 dryrun 子树（含正式目录的**子目录**，四次复核补）。"""
         led = self._ledger()
         res = led.open_position("2026-09-30", capital=1.0, persist=False)
         self.assertTrue(res["ledger"]["diagnostic"])                 # 诊断身份
         val = led.value("2026-10-02", ledger=res["ledger"])
         self.assertTrue(val["diagnostic"])
-        with self.assertRaises(RuntimeError) as cm:
-            led.save_valuation(val, out_dir=self.out)                # 显式指定正式目录 → 拒绝
-        self.assertIn("不得写入正式目录", str(cm.exception))
+        for bad in (self.out, os.path.join(self.out, "sub")):
+            with self.assertRaises(RuntimeError) as cm:
+                led.save_valuation(val, out_dir=bad)                 # 正式目录及其子目录 → 拒绝
+            self.assertIn("只能写入 dryrun", str(cm.exception))
         r = led.save_valuation(val)                                  # 默认只能落 dryrun
         self.assertEqual(os.path.dirname(r["path"]), self.dry)
+        r2 = led.save_valuation(val, out_dir=os.path.join(self.dry, "sub"))
+        self.assertIn("sub", r2["path"])                             # dryrun 子目录允许
+
+    def test_simulate_open_rejected_in_official_dir(self):
+        """P1（四次复核）：simulate=True 指定正式目录/子目录 → 拒绝，避免污染正式建仓。"""
+        led = self._ledger()
+        for bad in (self.out, os.path.join(self.out, "sub")):
+            with self.assertRaises(RuntimeError) as cm:
+                led.open_position("2026-09-30", simulate=True, out_dir=bad)
+            self.assertIn("只能写入 dryrun", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.out, "paper_ledger_2026-09.json")))
+        # dryrun 子树允许
+        res = led.open_position("2026-09-30", simulate=True,
+                                out_dir=os.path.join(self.dry, "sub"))
+        self.assertEqual(res["status"], "opened")
+        self.assertIn("sub", res["path"])
 
     def test_official_valuation_requires_execution_fact(self):
         """P1：正式（非诊断）账本估值/落盘必须能对上执行确认事实。"""
