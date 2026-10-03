@@ -125,12 +125,54 @@ class PaperLedger:
         self._series_cache[code] = df
         return df
 
-    def _data_hash(self, code: str) -> dict:
-        """该基金估值所用净值文件的数据指纹（P1 2026-10-02：数据一变，估值内容就不一致）。"""
-        path = os.path.join(self.history_dir, f"fund_{code}.csv")
+    def _data_fingerprint(self, code: str, open_ts: pd.Timestamp, as_of: pd.Timestamp) -> dict:
+        """估值所用**数据切片**的指纹（P2，2026-10-02 三次复核）。
+
+        旧实现用整文件 sha256 ⇒ 只要在估值日之后追加了新净值，历史估值就被判"内容不同"而拒绝
+        幂等重跑。现在幂等/差异判定以**实际参与估值的数据切片**为准：
+        切片 = 该基金 `(建仓成交日, 估值日]` 内参与复权累计的行（date/nav/daily_ret）；
+        整文件 sha256 仅作**来源记录**保留（`nav_file_sha256`），不参与幂等判定。
+        """
         s = self._series(code)
-        return {"nav_file": f"fund_{code}.csv", "sha256": _sha256(path),
-                "last_date": s.index.max().strftime("%Y-%m-%d"), "n_rows": int(len(s))}
+        win = s[(s.index > open_ts) & (s.index <= as_of)]
+        rows = [[d.strftime("%Y-%m-%d"), float(r.nav), float(r.daily_ret)]
+                for d, r in zip(win.index, win.itertuples(index=False))]
+        payload = json.dumps({"open": open_ts.strftime("%Y-%m-%d"),
+                              "as_of": as_of.strftime("%Y-%m-%d"), "rows": rows},
+                             ensure_ascii=False, separators=(",", ":"))
+        path = os.path.join(self.history_dir, f"fund_{code}.csv")
+        return {
+            "slice_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "slice_start": open_ts.strftime("%Y-%m-%d"),
+            "slice_end": (win.index[-1].strftime("%Y-%m-%d") if len(win)
+                          else open_ts.strftime("%Y-%m-%d")),
+            "slice_rows": int(len(win)),
+            "nav_file": f"fund_{code}.csv",
+            "nav_file_sha256": _sha256(path),          # 来源记录（不参与幂等判定）
+            "nav_file_last_date": s.index.max().strftime("%Y-%m-%d"),
+        }
+
+    def _verify_official_execution(self, cohort: str | None, run_id: str | None,
+                                   execution_date: str | None,
+                                   events_path: str | None = None) -> dict:
+        """正式（非诊断）账本/估值必须能对上执行确认事实（P1，2026-10-02 三次复核）。
+
+        防止"未确认执行的计算结果"绕过建仓校验、直接以正式身份写盘。
+        """
+        cid = cohort or self.cohort
+        fact = execution_fact(cid, events_path)
+        if not fact:
+            raise RuntimeError(
+                f"cohort {cid} 无执行确认事件——正式账本/估值必须绑定已确认的执行，拒绝写盘")
+        if execution_date and fact.get("execution_date") != execution_date:
+            raise ValueError(
+                f"执行事件执行日（{fact.get('execution_date')}）与账本记录（{execution_date}）不一致")
+        src_ev = fact.get("source_run_id")
+        if not src_ev:
+            raise ValueError("执行事件缺少 source_run_id——无法与来源绑定，拒绝正式写盘")
+        if run_id and src_ev != run_id:
+            raise ValueError(f"执行事件来源（{src_ev}）与账本来源（{run_id}）不一致")
+        return fact
 
     def _open_price(self, code: str, execution_date: pd.Timestamp) -> dict:
         """建仓成交价：执行日或之后**第一个披露日**的净值（迟发顺延并记录 lag_days）。"""
@@ -188,6 +230,9 @@ class PaperLedger:
             "total_buy_fee": fees,
             "cash": cash,
             "lag_funds": [p["fund_code"] for p in positions if p["lag_days"] > 0],
+            # build_position 是**纯计算**（未绑定执行事实）→ 默认诊断身份；
+            # open_position 仅在真实记账路径下、核对执行事实后改判为正式（diagnostic=False）。
+            "diagnostic": True,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -203,13 +248,10 @@ class PaperLedger:
           ① `execution_date` 与事件一致；② **事件的 `source_run_id` 与封存输入 run_id 一致**
           （P1 修复：防止拿别的 run 的封存输入给本次执行建仓）。
         """
-        payload = self.build_position(execution_date, capital)
-        payload["simulated"] = bool(simulate)
-        if simulate:
-            payload["note"] = "预演（dry-run）：未确认执行，不得作为绩效证据"
-        if not persist:
-            return {"status": "computed", "path": None, "ledger": payload}
-        if not simulate:
+        # P1（2026-10-02 三次复核）：真实记账**先核对执行事实**（含来源绑定），再算价格——
+        # 这样"未确认执行"的报错不会被"净值尚未披露"掩盖，语义上也是"先确认、后记账"。
+        fact = None
+        if persist and not simulate:
             fact = execution_fact(self.cohort, events_path)
             if not fact:
                 raise RuntimeError(
@@ -219,14 +261,32 @@ class PaperLedger:
                 raise ValueError(
                     f"execution_date（{execution_date}）与确认事件（{fact['execution_date']}）不一致")
             src_in, src_ev = self.inputs.get("run_id"), fact.get("source_run_id")
-            if src_ev and src_in and src_ev != src_in:
+            if not src_in:
+                raise ValueError("封存输入缺少 run_id——无法与执行事件绑定，拒绝建仓")
+            if not src_ev:
+                raise ValueError("执行事件缺少 source_run_id——无法与封存输入绑定，拒绝建仓")
+            if src_ev != src_in:
                 raise ValueError(
                     f"封存输入来源 run_id={src_in} 与执行事件来源 run_id={src_ev} 不一致——"
                     f"不得用其他 run 的封存输入为本次执行建仓")
+
+        payload = self.build_position(execution_date, capital)
+        payload["simulated"] = bool(simulate)
+        # P1：未确认执行的计算结果必须带**诊断身份**，否则会被当成正式账本、
+        # 进而让 value/save_valuation 写进正式目录。
+        payload["diagnostic"] = bool(simulate or not persist)
+        if simulate:
+            payload["note"] = "预演（dry-run）：未确认执行，不得作为绩效证据"
+        if not persist:
+            payload["note"] = "纯计算（persist=False）：未确认执行、未落盘，不得作为绩效证据"
+            return {"status": "computed", "path": None, "ledger": payload}
+        if fact is not None:
             payload["execution_event"] = {"event_id": fact.get("event_id"),
                                           "exec_type": fact.get("exec_type"),
-                                          "source_run_id": src_ev,
+                                          "source_run_id": fact.get("source_run_id"),
                                           "operator": fact.get("operator")}
+            payload["diagnostic"] = False          # 已绑定确认的执行事实 → 正式身份
+            payload.pop("note", None)
         out_dir = out_dir or (self.dryrun_dir if simulate else self.out_dir)
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"paper_ledger_{self.cohort}.json")
@@ -245,7 +305,7 @@ class PaperLedger:
 
     # ---------------- 估值 ----------------
     def value(self, as_of: str, ledger: dict | None = None,
-              allow_pending: bool = False) -> dict:
+              allow_pending: bool = False, events_path: str | None = None) -> dict:
         """按协议估值：官方日增长率复权累计 + 现金计息（不写盘）。
 
         P1 修复（2026-10-02 用户复核）：
@@ -264,6 +324,12 @@ class PaperLedger:
         exec_ts = pd.Timestamp(led["execution_date"])
         if ts < exec_ts:
             raise ValueError(f"估值日（{as_of}）早于建仓日（{led['execution_date']}）")
+        diag = bool(led.get("simulated") or led.get("diagnostic"))
+        if not diag:
+            # P1（2026-10-02 三次复核）：正式账本估值前**再次**核对执行事实，
+            # 防止"未确认执行的计算结果"绕过建仓校验而以正式身份出估值/写盘
+            self._verify_official_execution(led.get("cohort"), led.get("run_id"),
+                                           led.get("execution_date"), events_path)
 
         pending = [p for p in led["positions"] if pd.Timestamp(p["nav_date"]) > ts]
         if pending and not allow_pending:
@@ -277,7 +343,7 @@ class PaperLedger:
         rows, market_value, lag_rows, data_hashes, pending_rows = [], 0.0, [], {}, []
         for p in led["positions"]:
             open_ts = pd.Timestamp(p["nav_date"])
-            data_hashes[p["fund_code"]] = self._data_hash(p["fund_code"])
+            data_hashes[p["fund_code"]] = self._data_fingerprint(p["fund_code"], open_ts, ts)
             if open_ts > ts:                       # 仅 allow_pending 路径可达
                 pending_rows.append({"fund_code": p["fund_code"], "nav_date": p["nav_date"],
                                      "why": "成交净值日晚于估值日，建仓尚未发生"})
@@ -337,6 +403,7 @@ class PaperLedger:
                           "（不插值、不猜）",
             "valuation_basis": "official_daily_growth_rate（复权累计，含分红再投资）",
             "data_hashes": data_hashes,
+            "diagnostic": diag,                    # 与账本一致：诊断结果不得写正式目录
             "simulated": bool(led.get("simulated")),
             "protocol_sha": _sha256(self.inputs_path),
         }
@@ -352,6 +419,24 @@ class PaperLedger:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
 
+    @staticmethod
+    def _comparable(val: dict) -> dict:
+        """幂等比较视图：剔除易变字段与**纯来源记录**（P2 2026-10-02 三次复核）。
+
+        剔除项：`generated_at`、`revision`（每次写入不同），以及每只基金的整文件哈希
+        `nav_file_sha256` / `nav_file_last_date`——它们只作来源记录，**不参与差异判定**；
+        差异判定以 `slice_sha256`（实际参与估值的数据切片）为准，因此"估值日之后追加净值"
+        不会误判为内容变化，而"估值区间内数据被改动"仍会被检出。
+        """
+        v = json.loads(json.dumps(val, ensure_ascii=False, default=str))
+        v.pop("generated_at", None)
+        v.pop("revision", None)
+        for fp in (v.get("data_hashes") or {}).values():
+            if isinstance(fp, dict):
+                fp.pop("nav_file_sha256", None)
+                fp.pop("nav_file_last_date", None)
+        return v
+
     def save_valuation(self, val: dict, out_dir: str | None = None, revision: bool = False,
                        revision_reason: str | None = None) -> dict:
         """写估值快照（不可变）。
@@ -365,7 +450,14 @@ class PaperLedger:
         """
         if val.get("status") == "pending":
             raise RuntimeError("估值处于 pending（成交净值日尚未到来）——不得落盘为完成估值")
-        out_dir = out_dir or (self.dryrun_dir if val.get("simulated") else self.out_dir)
+        diag = bool(val.get("simulated") or val.get("diagnostic"))
+        if diag and out_dir and os.path.abspath(out_dir) == os.path.abspath(self.out_dir):
+            raise RuntimeError("诊断/预演结果不得写入正式目录 ml/paper/ledgers/（只能写 dryrun/）")
+        if not diag:
+            # P1（2026-10-02 三次复核）：正式估值落盘前**再次**核对执行事实
+            self._verify_official_execution(val.get("cohort"), val.get("run_id"),
+                                           val.get("execution_date"))
+        out_dir = out_dir or (self.dryrun_dir if diag else self.out_dir)
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"valuation_{val['cohort']}_{val['as_of']}.json")
         payload = dict(val)
@@ -374,11 +466,7 @@ class PaperLedger:
         if exists:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
-            a, b = dict(old), dict(payload)
-            for k in ("generated_at", "revision"):
-                a.pop(k, None)
-                b.pop(k, None)
-            if a == b:
+            if self._comparable(old) == self._comparable(payload):
                 return {"status": "existing", "path": path}
             if not revision:
                 raise RuntimeError(
@@ -401,7 +489,11 @@ class PaperLedger:
 
         建仓日无价格变化、尚无利息时（单 cohort）应得 `1/6×(1−buy_fee) + 5/6 = 0.99975`。
         估值日晚于其 execution_date 才计入的 cohort 才算已建仓；未建仓部分权重留在现金。
-        现金计息以**最早建仓日**为起点（简化：多 cohort 的逐段计息待后续），口径在 `cash_days` 明示。
+
+        现金计息按**现金流逐段**计算（P1，2026-10-02 三次复核）：旧实现把"最终剩余现金"整段
+        从最早建仓日起计息，遗漏了"后来要投入的现金在此前赚到的利息"。正确做法是在时间轴上
+        逐段推进——先计息到该 cohort 的建仓日，再扣除其投入资本：两批相隔 32 天、基金收益为零时
+        组合净值应为 `1.000962429`（旧实现给 `1.000669943`，少计约 2.93bp）。
         """
         ts = pd.Timestamp(as_of)
         if ledger_paths is None:
@@ -409,33 +501,63 @@ class PaperLedger:
             if include_simulated:      # 预演场景：把 dryrun 账本也纳入汇总
                 ledger_paths += sorted(glob.glob(
                     os.path.join(self.dryrun_dir, "paper_ledger_*.json")))
-        cohorts, cash_weight, earliest = [], float(total_capital), None
+        rate = float(self.protocol["cash_annual_rate"])
+        entries = []
         for p in ledger_paths:
             with open(p, encoding="utf-8") as f:
                 led = json.load(f)
             if led.get("simulated") and not include_simulated:
                 continue
-            if pd.Timestamp(led["execution_date"]) > ts:
+            exec_ts = pd.Timestamp(led["execution_date"])
+            if exec_ts > ts:
                 continue                                   # 估值日尚未建仓
-            w = float(led["capital"]) / float(total_capital)
-            v = self.value(as_of, ledger=led)
-            cohorts.append({"cohort": led["cohort"], "weight": w, "cohort_nav": v["cohort_nav"],
-                            "market_value": v["market_value"], "cash_grown": v["cash_grown"],
-                            "status": v["status"], "ledger": os.path.basename(p)})
-            cash_weight -= w
-            e = pd.Timestamp(led["execution_date"])
-            earliest = e if earliest is None or e < earliest else earliest
-        days = int((ts - earliest).days) if earliest is not None else 0
+            entries.append({"led": led, "path": p, "exec_ts": exec_ts,
+                            "weight": float(led["capital"]) / float(total_capital)})
+        entries.sort(key=lambda e: e["exec_ts"])
+
+        cohorts, segments = [], []
+        cash = float(total_capital)
+        prev = None
+        for e in entries:
+            if prev is not None:
+                d = int((e["exec_ts"] - prev).days)
+                if d > 0:
+                    before = cash
+                    cash = cash_growth(cash, d, rate)
+                    segments.append({"kind": "interest", "from": prev.strftime("%Y-%m-%d"),
+                                     "to": e["exec_ts"].strftime("%Y-%m-%d"), "days": d,
+                                     "cash_before": before, "cash_after": cash})
+            cash -= e["weight"] * float(total_capital)
+            segments.append({"kind": "invest", "date": e["exec_ts"].strftime("%Y-%m-%d"),
+                             "cohort": e["led"]["cohort"],
+                             "amount": -e["weight"] * float(total_capital), "cash_after": cash})
+            v = self.value(as_of, ledger=e["led"])
+            cohorts.append({"cohort": e["led"]["cohort"], "weight": e["weight"],
+                            "cohort_nav": v["cohort_nav"], "market_value": v["market_value"],
+                            "cash_grown": v["cash_grown"], "status": v["status"],
+                            "ledger": os.path.basename(e["path"])})
+            prev = e["exec_ts"]
+        days_total = int((ts - entries[0]["exec_ts"]).days) if entries else 0
+        if prev is not None:
+            d = int((ts - prev).days)
+            if d > 0:
+                before = cash
+                cash = cash_growth(cash, d, rate)
+                segments.append({"kind": "interest", "from": prev.strftime("%Y-%m-%d"),
+                                 "to": as_of, "days": d,
+                                 "cash_before": before, "cash_after": cash})
+        cash_weight = cash / float(total_capital)
         invested = sum(c["cohort_nav"] * c["weight"] for c in cohorts)
-        cash = cash_growth(cash_weight, days, float(self.protocol["cash_annual_rate"]))
         return {
             "as_of": as_of, "n_cohorts": len(cohorts), "cohorts": cohorts,
-            "cash_weight": cash_weight, "cash_days": days, "cash_grown": cash,
+            "cash_weight": cash_weight, "cash_grown": cash,
+            "cash_segments": segments, "cash_days_total": days_total,
             "invested_value": invested, "portfolio_nav": invested + cash,
             "portfolio_return_since_start": invested + cash - 1.0,
             "basis": "组合净值 = Σ(cohort_nav × cohort_weight) + 未投资现金计息"
                      "（cohort_nav 是单个 cohort 的净值，起点 1.0）",
-            "cash_note": "现金按 2%/年 actual-365 日复利，以最早建仓日为起点（多 cohort 逐段计息待后续）",
+            "cash_note": "现金按 2%/年 actual-365 日复利，**按现金流逐段计息**"
+                         "（先计息到各 cohort 建仓日、再扣除其投入资本；明细见 cash_segments）",
         }
 
 
@@ -463,6 +585,7 @@ def main():
                                 persist=not args.no_save)
         lg = res["ledger"]
         print(f"  状态：{res['status']} | 文件：{res['path'] or '（--no-save 纯计算，未写盘）'}")
+        print(f"  封存输入：{led.inputs_path}")
         print(f"  cohort 资本 {lg['capital']:.6f} | 持仓 {lg['n_positions']} 只 | 申购费合计 "
               f"{lg['total_buy_fee']:.8f} | 现金 {lg['cash']:.6f}"
               f" | 迟发 {len(lg['lag_funds'])} 只")
@@ -477,7 +600,7 @@ def main():
               f"{val['cohort_return_since_open']:.4%} | 市值 {val['market_value']:.6f}"
               f" | cohort 现金 {val['cash_grown']:.6f}")
         print(f"  组合净值 {pv['portfolio_nav']:.6f}（{pv['n_cohorts']} 个已建仓 cohort；"
-              f"未投资现金权重 {pv['cash_weight']:.6f}，计息 {pv['cash_days']} 天）")
+              f"未投资现金权重 {pv['cash_weight']:.6f}，逐段计息 {pv['cash_days_total']} 天）")
         if val["stale_funds"]:
             print(f"  ⚠️ 迟发未披露 {len(val['stale_funds'])} 只（按最后可用净值估值）")
         print(f"  估值快照：{res['path']}（{res['status']}）")
@@ -486,7 +609,7 @@ def main():
         pv = led.portfolio_value(args.portfolio, include_simulated=args.dry_run)
         print(f"  组合净值 {pv['portfolio_nav']:.6f} | 区间收益 "
               f"{pv['portfolio_return_since_start']:.4%} | 已建仓 cohort {pv['n_cohorts']} 个"
-              f" | 现金权重 {pv['cash_weight']:.6f}（计息 {pv['cash_days']} 天 → "
+              f" | 现金权重 {pv['cash_weight']:.6f}（逐段计息 {pv['cash_days_total']} 天 → "
               f"{pv['cash_grown']:.6f}）")
         return
     ap.print_help()

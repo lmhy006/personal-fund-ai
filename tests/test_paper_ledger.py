@@ -108,7 +108,7 @@ class TestPaperLedger(_LedgerFixture):
         # 账本估值里的现金计息同口径
         led = self._ledger()
         fake = {"cohort": "2026-09", "run_id": "RID_TEST", "execution_date": "2026-09-30",
-                "capital": 1.0, "initial_nav": 1.0, "cash": 0.5,
+                "capital": 1.0, "initial_nav": 1.0, "cash": 0.5, "diagnostic": True,
                 "positions": [{"fund_code": "A00002", "shares": 0.0, "nav_at_open": 2.0,
                                "nav_date": "2026-09-30"}]}
         val = led.value("2026-10-02", ledger=fake)
@@ -144,7 +144,8 @@ class TestPaperLedger(_LedgerFixture):
         events = os.path.join(self.tmp, "events.jsonl")
         with open(events, "w", encoding="utf-8") as f:
             f.write(json.dumps({"event_id": "e1", "type": "paper", "cohort": "2026-09",
-                                "execution_date": "2026-10-02"}) + "\n")
+                                "execution_date": "2026-10-02",
+                                "source_run_id": "RID_TEST"}) + "\n")
         with self.assertRaises(ValueError):
             led.open_position("2026-09-30", capital=1.0, events_path=events)
         res = led.open_position("2026-10-02", capital=1.0, events_path=events)
@@ -216,37 +217,133 @@ class TestPaperLedgerHardening(_LedgerFixture):
             led.save_valuation(val)                         # pending 不得落盘
 
     def test_valuation_immutable_and_revision(self):
-        """P1：同日估值重跑幂等；数据被改动后拒绝覆盖；显式 revision 留痕。"""
+        """P1：同日估值重跑幂等；数据被改动后拒绝覆盖；显式 revision 留痕。
+
+        这里用 build_position 的诊断账本 → 估值只能落 dryrun 目录。
+        """
         led = self._ledger()
         payload = led.build_position("2026-09-30", capital=1.0)
         val = led.value("2026-10-02", ledger=payload)
+        self.assertTrue(val["diagnostic"])
         r1 = led.save_valuation(val)
         self.assertEqual(r1["status"], "written")
+        self.assertEqual(os.path.dirname(r1["path"]), self.dry)      # 诊断不得进正式目录
         r2 = led.save_valuation(led.value("2026-10-02", ledger=payload))
         self.assertEqual(r2["status"], "existing")          # 幂等
-        # 改动净值数据 → data_hashes 变 → 内容不同 → 拒绝
+        # 改动净值数据（估值区间内）→ 切片指纹变 → 内容不同 → 拒绝
         self._fund("A00001", [("2026-09-30", 1.0, 0.0), ("2026-10-01", 1.2, 0.20),
                               ("2026-10-02", 1.44, 0.20)])
         led2 = self._ledger()
         val2 = led2.value("2026-10-02", ledger=led2.build_position("2026-09-30", capital=1.0))
-        self.assertNotEqual(val["data_hashes"]["A00001"]["sha256"],
-                            val2["data_hashes"]["A00001"]["sha256"])
+        self.assertNotEqual(val["data_hashes"]["A00001"]["slice_sha256"],
+                            val2["data_hashes"]["A00001"]["slice_sha256"])
         with self.assertRaises(RuntimeError) as cm:
             led2.save_valuation(val2)
         self.assertIn("不可变", str(cm.exception))
         r3 = led2.save_valuation(val2, revision=True, revision_reason="净值数据更正后重算")
         self.assertEqual(r3["status"], "revised")
-        baks = [f for f in os.listdir(self.out) if ".rev_" in f]
+        baks = [f for f in os.listdir(self.dry) if ".rev_" in f]
         self.assertEqual(len(baks), 1)
         with open(r3["path"], encoding="utf-8") as f:
             self.assertEqual(json.load(f)["revision"]["reason"], "净值数据更正后重算")
+
+    def test_slice_fingerprint_ignores_later_appended_data(self):
+        """P2：仅追加估值日**之后**的净值，不应影响估值幂等判定。"""
+        led = self._ledger()
+        payload = led.build_position("2026-09-30", capital=1.0)
+        val1 = led.value("2026-10-02", ledger=payload)
+        r1 = led.save_valuation(val1)
+        self.assertEqual(r1["status"], "written")
+        # 追加 10-05（估值日之后）→ 整文件哈希变、切片不变
+        self._fund("A00001", [("2026-09-30", 1.0, 0.0), ("2026-10-01", 1.1, 0.10),
+                              ("2026-10-02", 1.21, 0.10), ("2026-10-05", 1.331, 0.10)])
+        led2 = self._ledger()
+        val2 = led2.value("2026-10-02", ledger=led2.build_position("2026-09-30", capital=1.0))
+        self.assertEqual(val1["data_hashes"]["A00001"]["slice_sha256"],
+                         val2["data_hashes"]["A00001"]["slice_sha256"])
+        self.assertNotEqual(val1["data_hashes"]["A00001"]["nav_file_sha256"],
+                            val2["data_hashes"]["A00001"]["nav_file_sha256"])
+        self.assertEqual(led2.save_valuation(val2)["status"], "existing")   # 不再被误拒
+
+    def test_diagnostic_result_cannot_write_official_dir(self):
+        """P1：未确认执行的计算结果必须带诊断身份，且不得写入正式目录。"""
+        led = self._ledger()
+        res = led.open_position("2026-09-30", capital=1.0, persist=False)
+        self.assertTrue(res["ledger"]["diagnostic"])                 # 诊断身份
+        val = led.value("2026-10-02", ledger=res["ledger"])
+        self.assertTrue(val["diagnostic"])
+        with self.assertRaises(RuntimeError) as cm:
+            led.save_valuation(val, out_dir=self.out)                # 显式指定正式目录 → 拒绝
+        self.assertIn("不得写入正式目录", str(cm.exception))
+        r = led.save_valuation(val)                                  # 默认只能落 dryrun
+        self.assertEqual(os.path.dirname(r["path"]), self.dry)
+
+    def test_official_valuation_requires_execution_fact(self):
+        """P1：正式（非诊断）账本估值/落盘必须能对上执行确认事实。"""
+        led = self._ledger()
+        payload = led.build_position("2026-09-30", capital=1.0)
+        payload["diagnostic"] = False                                # 伪装成"正式"账本
+        with self.assertRaises(RuntimeError) as cm:
+            led.value("2026-10-02", ledger=payload)
+        self.assertIn("无执行确认事件", str(cm.exception))
+        with self.assertRaises(RuntimeError):
+            led.save_valuation({**led.value("2026-10-02", ledger={**payload, "diagnostic": True}),
+                                "diagnostic": False})
+
+    def test_event_without_source_run_id_rejected(self):
+        """P1：执行事件缺 source_run_id → 直接拒绝建仓（不得放行）。"""
+        led = self._ledger()
+        ev = os.path.join(self.tmp, "events_nosrc.jsonl")
+        with open(ev, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event_id": "e1", "type": "paper", "cohort": "2026-09",
+                                "execution_date": "2026-09-30"}) + "\n")
+        with self.assertRaises(ValueError) as cm:
+            led.open_position("2026-09-30", capital=1.0, events_path=ev)
+        self.assertIn("缺少 source_run_id", str(cm.exception))
+
+    def _fake_ledger(self, cohort, exec_date, fund, nav, capital=1 / 6):
+        return {"cohort": cohort, "run_id": f"R_{cohort}", "execution_date": exec_date,
+                "capital": capital, "initial_nav": 1.0, "cash": 0.0,
+                "positions": [{"fund_code": fund, "shares": capital * (1 - 0.0015) / nav,
+                               "nav_at_open": nav, "nav_date": exec_date}],
+                "simulated": True, "diagnostic": True}
+
+    def test_portfolio_cash_segmented_interest(self):
+        """P1：多 cohort 现金必须**逐段**计息（用户样本：相隔 32 天 → 1.000962429）。"""
+        led = self._ledger()
+        l1 = self._fake_ledger("2026-09", "2026-09-30", "A00002", 2.0)
+        l2 = self._fake_ledger("2026-10", "2026-11-01", "A00002", 2.0)   # +32 天
+        p1 = os.path.join(self.tmp, "paper_ledger_2026-09.json")
+        p2 = os.path.join(self.tmp, "paper_ledger_2026-10.json")
+        for p, l in ((p1, l1), (p2, l2)):
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(l, f)
+        pv = led.portfolio_value("2026-11-01", ledger_paths=[p1, p2], include_simulated=True)
+        self.assertEqual(pv["n_cohorts"], 2)
+        self.assertAlmostEqual(pv["cohorts"][0]["cohort_nav"], 1 - 0.0015, places=12)
+        # 逐段计息解析解：[(5/6)·A − 1/6] + 2/6·(1−0.0015)，A=(1+0.02/365)^32
+        a = (1 + 0.02 / 365) ** 32
+        expected = ((5 / 6) * a - 1 / 6) + (2 / 6) * (1 - 0.0015)
+        self.assertAlmostEqual(pv["portfolio_nav"], expected, places=12)
+        self.assertAlmostEqual(pv["portfolio_nav"], 1.000962429, places=9)   # 用户样本
+        # 反例：旧的"整段计息"会给 1.000669943，少计约 2.93bp
+        naive = (2 / 6) * (1 - 0.0015) + (4 / 6) * a
+        self.assertLess(naive, pv["portfolio_nav"])
+        self.assertAlmostEqual(naive, 1.000669943, places=9)
+        self.assertGreater(pv["portfolio_nav"] - naive, 2.9e-4)
+        self.assertEqual(len(pv["cash_segments"]), 3)        # 投入、计息、投入
 
     def test_data_hashes_recorded_per_fund(self):
         led = self._ledger()
         val = led.value("2026-10-02", ledger=led.build_position("2026-09-30", capital=1.0))
         self.assertEqual(set(val["data_hashes"]), {"A00001", "A00002"})
-        self.assertEqual(val["data_hashes"]["A00001"]["last_date"], "2026-10-02")
-        self.assertEqual(len(val["data_hashes"]["A00001"]["sha256"]), 64)
+        fp = val["data_hashes"]["A00001"]
+        # 切片指纹（P2）：以实际参与估值的数据为准，整文件哈希仅作来源记录
+        self.assertEqual(fp["slice_start"], "2026-09-30")
+        self.assertEqual(fp["slice_end"], "2026-10-02")
+        self.assertEqual(fp["slice_rows"], 2)          # (9-30, 10-02] → 10-01、10-02
+        self.assertEqual(len(fp["slice_sha256"]), 64)
+        self.assertEqual(len(fp["nav_file_sha256"]), 64)
 
     def test_portfolio_value_analytic(self):
         """组合层：建仓日无价格变化时应为 1/6×(1−0.0015) + 5/6 = 0.99975。"""
